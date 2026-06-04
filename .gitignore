@@ -50,6 +50,9 @@ htmlcov/
 .coverage
 .coverage.*
 
+# ---------- Large data (do NOT commit the big CSVs) ----------
+test-data/*.csv
+
 # ---------- Editor / OS ----------
 .vscode/
 .idea/

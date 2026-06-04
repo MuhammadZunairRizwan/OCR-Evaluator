@@ -1,53 +1,14 @@
-import { useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { evaluate } from "./api.js";
+import { parseNaraCsv } from "./csv.js";
+import { DEMO_RECORDS } from "./demoData.js";
 
-const SAMPLE_GT =
-  "The quick brown fox jumps over the lazy dog.\nHandwritten notes are hard to read.";
-const SAMPLE_OCR =
-  "The qulck brown fox jumps over the lazy dog.\nHandwriten notes are hard to reads.";
+const pct = (x) => `${(x * 100).toFixed(2)}%`;
+const fmt = (n) => n.toLocaleString();
 
-function EditorPanel({ title, value, onChange, onFile, accent }) {
-  const inputRef = useRef(null);
-
-  const handleFile = (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => onChange(String(reader.result ?? ""));
-    reader.readAsText(file);
-    onFile?.(file.name);
-    e.target.value = ""; // allow re-uploading the same file
-  };
-
-  return (
-    <div className="panel">
-      <div className="panel-head">
-        <span className="dot" style={{ background: accent }} />
-        <h2>{title}</h2>
-        <button className="upload-btn" onClick={() => inputRef.current?.click()}>
-          Upload .txt
-        </button>
-        <input
-          ref={inputRef}
-          type="file"
-          accept=".txt,text/plain"
-          onChange={handleFile}
-          hidden
-        />
-      </div>
-      <textarea
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder={`Paste or upload ${title.toLowerCase()}…`}
-        spellCheck={false}
-      />
-      <div className="counts">
-        {value.trim() ? value.trim().split(/\s+/).length : 0} words ·{" "}
-        {value.length} chars
-      </div>
-    </div>
-  );
-}
+// ---- Demo maps (available before any CSV is uploaded) ----
+const DEMO_GT = new Map(DEMO_RECORDS.map((r) => [r.naId, r.gt]));
+const DEMO_OCR = new Map(DEMO_RECORDS.map((r) => [r.naId, r.ocr]));
 
 function HighlightView({ segments }) {
   return (
@@ -71,184 +32,292 @@ function Metric({ label, value, hint, good }) {
   );
 }
 
-const pct = (x) => `${(x * 100).toFixed(2)}%`;
+function CsvPicker({ label, filename, count, accent, onPick, disabled }) {
+  const ref = useRef(null);
+  return (
+    <div className="csv-picker">
+      <div className="csv-label">
+        <span className="dot" style={{ background: accent }} /> {label}
+      </div>
+      <button onClick={() => ref.current?.click()} disabled={disabled}>
+        Choose CSV
+      </button>
+      <input
+        ref={ref}
+        type="file"
+        accept=".csv,text/csv"
+        hidden
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          if (f) onPick(f);
+          e.target.value = "";
+        }}
+      />
+      <span className="csv-status">
+        {filename ? `${filename} — ${fmt(count)} rows` : "No file chosen"}
+      </span>
+    </div>
+  );
+}
 
 export default function App() {
-  const [gt, setGt] = useState("");
-  const [ocr, setOcr] = useState("");
+  const [naidInput, setNaidInput] = useState("");
+  const [current, setCurrent] = useState(null); // {naId, gt, ocr}
   const [result, setResult] = useState(null);
-  const [mode, setMode] = useState("word"); // "word" | "char"
+  const [mode, setMode] = useState("word");
   const [ignoreCase, setIgnoreCase] = useState(false);
   const [ignorePunct, setIgnorePunct] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [showPlain, setShowPlain] = useState(false);
 
-  const run = async (opts = { ignoreCase, ignorePunct }) => {
+  // Uploaded CSV maps (null until parsed)
+  const [gtUpload, setGtUpload] = useState(null); // {name, map}
+  const [ocrUpload, setOcrUpload] = useState(null);
+  const [parsing, setParsing] = useState(""); // status text while parsing
+
+  const full = gtUpload && ocrUpload;
+  const gtMap = full ? gtUpload.map : DEMO_GT;
+  const ocrMap = full ? ocrUpload.map : DEMO_OCR;
+
+  const available = useMemo(() => {
+    const ids = [];
+    for (const id of gtMap.keys()) if (ocrMap.has(id)) ids.push(id);
+    return ids;
+  }, [gtMap, ocrMap]);
+
+  const runEval = async (gt, ocr, opts) => {
     setError("");
     setLoading(true);
     try {
       const data = await evaluate(gt, ocr, opts);
       setResult(data);
     } catch (e) {
-      setError(e.message || "Failed to evaluate. Is the backend running?");
+      setError(e.message || "Failed to evaluate. Is the backend awake?");
       setResult(null);
     } finally {
       setLoading(false);
     }
   };
 
-  // Re-run automatically when a normalization toggle changes (if we have a result).
-  const toggleCase = () => {
-    const next = !ignoreCase;
-    setIgnoreCase(next);
-    if (result) run({ ignoreCase: next, ignorePunct });
-  };
-  const togglePunct = () => {
-    const next = !ignorePunct;
-    setIgnorePunct(next);
-    if (result) run({ ignoreCase, ignorePunct: next });
+  const viewRecord = (id) => {
+    const naId = String(id).trim();
+    if (!naId) {
+      setError("Enter a National Archives ID (NAID).");
+      return;
+    }
+    const gt = gtMap.get(naId);
+    const ocr = ocrMap.get(naId);
+    if (gt === undefined && ocr === undefined) {
+      setError(
+        `NAID ${naId} not found${full ? "" : " in the demo set — upload both CSVs to search all 2,260 records"}.`
+      );
+      return;
+    }
+    if (gt === undefined) return setError(`No ground-truth row for NAID ${naId}.`);
+    if (ocr === undefined) return setError(`No OCR row for NAID ${naId}.`);
+
+    setCurrent({ naId, gt, ocr });
+    setShowPlain(false);
+    runEval(gt, ocr, { ignoreCase, ignorePunct });
   };
 
-  const loadSample = () => {
-    setGt(SAMPLE_GT);
-    setOcr(SAMPLE_OCR);
-    setResult(null);
+  const random = () => {
+    if (!available.length) return;
+    const id = available[Math.floor(Math.random() * available.length)];
+    setNaidInput(id);
+    viewRecord(id);
   };
 
-  const clearAll = () => {
-    setGt("");
-    setOcr("");
-    setResult(null);
+  const onToggle = (which) => {
+    const next = which === "case" ? !ignoreCase : !ignorePunct;
+    if (which === "case") setIgnoreCase(next);
+    else setIgnorePunct(next);
+    if (current) {
+      runEval(current.gt, current.ocr, {
+        ignoreCase: which === "case" ? next : ignoreCase,
+        ignorePunct: which === "punct" ? next : ignorePunct,
+      });
+    }
+  };
+
+  const handleCsv = async (file, side) => {
+    setParsing(`Parsing ${file.name}…`);
     setError("");
+    try {
+      const map = await parseNaraCsv(file, (n) =>
+        setParsing(`Parsing ${file.name}… ${fmt(n)} rows`)
+      );
+      const payload = { name: file.name, map };
+      if (side === "gt") setGtUpload(payload);
+      else setOcrUpload(payload);
+    } catch (e) {
+      setError(`Could not parse ${file.name}: ${e.message}`);
+    } finally {
+      setParsing("");
+    }
   };
 
-  const alignment = result
-    ? mode === "word"
-      ? result.word_alignment
-      : result.char_alignment
-    : null;
-  const counts = result
-    ? mode === "word"
-      ? result.word_counts
-      : result.char_counts
-    : null;
+  const lvl = result ? (mode === "word" ? result.word : result.char) : null;
 
   return (
     <div className="app">
       <header>
-        <h1>OCR Evaluation — CER &amp; WER</h1>
+        <div className="brand">NARA · CER / WER</div>
         <p>
-          Compare ground-truth text against OCR output. Matches are{" "}
-          <span className="g">green</span>, errors are{" "}
-          <span className="r">red</span>.
+          Enter a National Archives ID to compare its human transcription
+          (ground truth) against the OCR extraction. Matches are{" "}
+          <span className="g">green</span>, errors are <span className="r">red</span>.
         </p>
       </header>
 
-      <section className="editors">
-        <EditorPanel
-          title="Ground Truth"
-          value={gt}
-          onChange={setGt}
-          accent="#16a34a"
-        />
-        <EditorPanel
-          title="OCR Result"
-          value={ocr}
-          onChange={setOcr}
-          accent="#2563eb"
-        />
-      </section>
-
-      <div className="actions">
-        <button className="primary" onClick={() => run()} disabled={loading}>
-          {loading ? "Evaluating…" : "Evaluate"}
-        </button>
-        <button onClick={loadSample}>Load sample</button>
-        <button onClick={clearAll}>Clear</button>
+      {/* ---- Lookup controls ---- */}
+      <section className="lookup">
+        <div className="naid-row">
+          <div className="naid-field">
+            <label>National Archives ID</label>
+            <input
+              value={naidInput}
+              onChange={(e) => setNaidInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && viewRecord(naidInput)}
+              placeholder="e.g. 111406406"
+              inputMode="numeric"
+            />
+          </div>
+          <button className="primary" onClick={() => viewRecord(naidInput)} disabled={loading}>
+            {loading ? "Evaluating…" : "View record"}
+          </button>
+          <button onClick={random} disabled={loading || !available.length}>
+            Random
+          </button>
+        </div>
 
         <div className="norm-opts">
           <label>
-            <input type="checkbox" checked={ignoreCase} onChange={toggleCase} />
+            <input type="checkbox" checked={ignoreCase} onChange={() => onToggle("case")} />
             Ignore case
           </label>
           <label>
-            <input
-              type="checkbox"
-              checked={ignorePunct}
-              onChange={togglePunct}
-            />
+            <input type="checkbox" checked={ignorePunct} onChange={() => onToggle("punct")} />
             Ignore punctuation
           </label>
         </div>
-      </div>
+      </section>
+
+      {/* ---- Dataset / CSV upload ---- */}
+      <section className="dataset">
+        <div className="dataset-status">
+          <span className="dot" style={{ background: full ? "#16a34a" : "#d97706" }} />
+          {full ? (
+            <strong>Full dataset loaded ({fmt(available.length)} records)</strong>
+          ) : (
+            <>
+              <strong>Demo data loaded</strong> ({available.length} records) —
+              upload both CSVs to unlock the full dataset
+            </>
+          )}
+        </div>
+
+        <div className="csv-row">
+          <CsvPicker
+            label="Ground truth — naid_transcriptions.csv"
+            accent="#16a34a"
+            filename={gtUpload?.name}
+            count={gtUpload?.map.size ?? 0}
+            onPick={(f) => handleCsv(f, "gt")}
+            disabled={!!parsing}
+          />
+          <CsvPicker
+            label="OCR output — ocr_extraction.csv"
+            accent="#2563eb"
+            filename={ocrUpload?.name}
+            count={ocrUpload?.map.size ?? 0}
+            onPick={(f) => handleCsv(f, "ocr")}
+            disabled={!!parsing}
+          />
+        </div>
+        {parsing && <div className="parsing">{parsing}</div>}
+        {!full && (gtUpload || ocrUpload) && !parsing && (
+          <div className="hint">Select both CSVs to unlock all records.</div>
+        )}
+      </section>
 
       {error && <div className="error">{error}</div>}
 
-      {result && (
+      {/* ---- Results ---- */}
+      {result && current && (
         <>
           <section className="metrics">
-            <Metric
-              label="CER"
-              value={pct(result.cer)}
-              hint="Character Error Rate"
-            />
-            <Metric
-              label="WER"
-              value={pct(result.wer)}
-              hint="Word Error Rate"
-            />
-            <Metric
-              label="Char Accuracy"
-              value={pct(result.char_accuracy)}
-              good
-              hint="1 − CER"
-            />
-            <Metric
-              label="Word Accuracy"
-              value={pct(result.word_accuracy)}
-              good
-              hint="1 − WER"
-            />
+            <Metric label="CER" value={pct(result.cer)} hint="Character Error Rate" />
+            <Metric label="WER" value={pct(result.wer)} hint="Word Error Rate" />
+            <Metric label="Char Accuracy" value={pct(result.char_accuracy)} good hint="1 − CER" />
+            <Metric label="Word Accuracy" value={pct(result.word_accuracy)} good hint="1 − WER" />
           </section>
 
           <section className="breakdown">
-            <strong>{mode === "word" ? "Word" : "Character"} breakdown:</strong>{" "}
-            {counts.hits} correct · {counts.substitutions} substitutions ·{" "}
-            {counts.deletions} deletions · {counts.insertions} insertions ·{" "}
-            reference length {counts.ref_length}
+            <span className="naid-tag">NAID {current.naId}</span>{" "}
+            {lvl.counts ? (
+              <>
+                <strong>{mode === "word" ? "Word" : "Character"} breakdown:</strong>{" "}
+                {fmt(lvl.counts.hits)} correct · {fmt(lvl.counts.substitutions)} substitutions ·{" "}
+                {fmt(lvl.counts.deletions)} deletions · {fmt(lvl.counts.insertions)} insertions ·
+                reference length {fmt(lvl.ref_length)}
+              </>
+            ) : (
+              <>
+                <strong>{mode === "word" ? "Word" : "Character"} breakdown:</strong> edit distance{" "}
+                {fmt(lvl.distance)} over reference length {fmt(lvl.ref_length)} — exact
+                substitution/deletion/insertion split omitted (document too large).
+              </>
+            )}
           </section>
 
           <div className="mode-toggle">
             <span>Highlight by:</span>
-            <button
-              className={mode === "word" ? "active" : ""}
-              onClick={() => setMode("word")}
-            >
+            <button className={mode === "word" ? "active" : ""} onClick={() => setMode("word")}>
               Word
             </button>
-            <button
-              className={mode === "char" ? "active" : ""}
-              onClick={() => setMode("char")}
-            >
+            <button className={mode === "char" ? "active" : ""} onClick={() => setMode("char")}>
               Character
             </button>
+            {lvl.truncated && (
+              <button className="plain-toggle" onClick={() => setShowPlain((v) => !v)}>
+                {showPlain ? "Show highlighted preview" : "Show full plain text"}
+              </button>
+            )}
           </div>
+
+          {lvl.truncated && !showPlain && (
+            <div className="notice">
+              Diff preview — first {fmt(lvl.preview_limit)}{" "}
+              {mode === "word" ? "words" : "characters"} shown. The CER/WER and accuracy
+              above are exact for the <em>full</em> document.
+            </div>
+          )}
 
           <section className="compare">
             <div className="compare-col">
               <h3>Ground Truth</h3>
-              <HighlightView segments={alignment.left} />
+              {showPlain || !lvl.alignment ? (
+                <pre className="highlight plain">{current.gt}</pre>
+              ) : (
+                <HighlightView segments={lvl.alignment.left} />
+              )}
             </div>
             <div className="compare-col">
               <h3>OCR Result</h3>
-              <HighlightView segments={alignment.right} />
+              {showPlain || !lvl.alignment ? (
+                <pre className="highlight plain">{current.ocr}</pre>
+              ) : (
+                <HighlightView segments={lvl.alignment.right} />
+              )}
             </div>
           </section>
         </>
       )}
 
       <footer>
-        Frontend: React + Vite · Backend: FastAPI · CER/WER via Levenshtein
+        Frontend: React + Vite · Backend: FastAPI + rapidfuzz · CER/WER via Levenshtein
         alignment
       </footer>
     </div>

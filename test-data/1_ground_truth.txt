@@ -1,0 +1,3 @@
+The quick brown fox jumps over the lazy dog.
+Handwritten notes are often difficult to read.
+Optical character recognition is not always perfect.

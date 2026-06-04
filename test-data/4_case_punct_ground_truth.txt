@@ -1,0 +1,2 @@
+The Invoice Total Is Due On Friday.
+Please Pay The Amount: $1,250.00 Before The Deadline!

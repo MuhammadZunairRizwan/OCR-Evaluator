@@ -7,161 +7,50 @@ WER (Word Error Rate)      = (S + D + I) / N      over word tokens
 CER (Character Error Rate) = (S + D + I) / N      over character tokens
 
 where, comparing the OCR hypothesis against the ground-truth reference:
-    S = substitutions
-    D = deletions   (token present in reference, missing in hypothesis)
-    I = insertions  (token present in hypothesis, absent in reference)
-    N = number of tokens in the reference (ground truth)
+    S = substitutions, D = deletions, I = insertions, N = reference tokens.
 
-Accuracy is reported as 1 - error-rate (clamped to 0), i.e. how close the
-OCR output is to the human transcription.
+Accuracy is 1 - error-rate (clamped to 0).
+
+Scale
+-----
+NARA documents can be very large (200k+ characters). A naive O(n*m) DP matrix
+is impossible at that size, so the edit *distance* (which is all CER/WER need)
+is computed with rapidfuzz's C-backed Levenshtein in linear memory — fast even
+for the biggest records.
+
+The green/red side-by-side highlighting needs the full alignment (editops). We
+always produce it for documents under a size threshold. For larger documents we
+still report the exact full-document scores, plus a *truncated preview* of the
+alignment (first N tokens) so there is something to eyeball; the precise
+substitution/deletion/insertion split is omitted in that case.
 
 Normalization
 -------------
-Tokens carry a `display` string (the original text, used for highlighting) and
-a `key` string (used for comparison). Optional `ignore_case` / `ignore_punct`
-flags only affect the key, so the side-by-side view always shows the real text
-while the score reflects the chosen leniency.
-
-The same Levenshtein DP that yields the counts also yields an alignment,
-which we turn into colour-coded segments for the side-by-side view.
+Tokens carry a `display` string (original text, for highlighting) and a `key`
+string (for comparison). `ignore_case` / `ignore_punct` only affect the key, so
+the diff always shows real text while the score reflects the chosen leniency.
 """
 
 from __future__ import annotations
 
 import string
-from dataclasses import dataclass
-from typing import List, Literal, Optional, Sequence, Tuple
+from typing import List, Optional, Tuple
 
-Status = Literal["match", "error"]
+from rapidfuzz.distance import Levenshtein
 
 _PUNCT = set(string.punctuation)
 
-# A token is (key, display). key="" means "ignored" and is filtered out.
+# Above these sizes we skip the full alignment and show a truncated preview.
+CHAR_ALIGN_MAX = 20000   # characters
+WORD_ALIGN_MAX = 8000    # words
+
+# A token is (key, display).
 Token = Tuple[str, str]
 
 
-@dataclass
-class Counts:
-    substitutions: int
-    deletions: int
-    insertions: int
-    hits: int          # correct matches
-    ref_length: int    # N (tokens in ground truth)
-
-    @property
-    def errors(self) -> int:
-        return self.substitutions + self.deletions + self.insertions
-
-    @property
-    def error_rate(self) -> float:
-        if self.ref_length == 0:
-            # Empty reference: any hypothesis token is an insertion error.
-            return 0.0 if self.insertions == 0 else 1.0
-        return self.errors / self.ref_length
-
-    @property
-    def accuracy(self) -> float:
-        return max(0.0, 1.0 - self.error_rate)
-
-
-@dataclass
-class Segment:
-    text: str
-    status: Status
-
-
-def _align(ref: Sequence[Token], hyp: Sequence[Token]):
-    """
-    Levenshtein DP over two token sequences, comparing on token keys.
-
-    Returns (counts, ops) where ops is a list of (type, ref_tok, hyp_tok)
-    with type in {"equal", "sub", "del", "ins"}; tokens are (key, display).
-    """
-    n, m = len(ref), len(hyp)
-
-    cost = [[0] * (m + 1) for _ in range(n + 1)]
-    for i in range(1, n + 1):
-        cost[i][0] = i
-    for j in range(1, m + 1):
-        cost[0][j] = j
-
-    for i in range(1, n + 1):
-        for j in range(1, m + 1):
-            if ref[i - 1][0] == hyp[j - 1][0]:
-                cost[i][j] = cost[i - 1][j - 1]
-            else:
-                cost[i][j] = 1 + min(
-                    cost[i - 1][j - 1],  # substitution
-                    cost[i - 1][j],      # deletion
-                    cost[i][j - 1],      # insertion
-                )
-
-    ops = []
-    i, j = n, m
-    while i > 0 or j > 0:
-        if (
-            i > 0
-            and j > 0
-            and ref[i - 1][0] == hyp[j - 1][0]
-            and cost[i][j] == cost[i - 1][j - 1]
-        ):
-            ops.append(("equal", ref[i - 1], hyp[j - 1]))
-            i, j = i - 1, j - 1
-        elif i > 0 and j > 0 and cost[i][j] == cost[i - 1][j - 1] + 1:
-            ops.append(("sub", ref[i - 1], hyp[j - 1]))
-            i, j = i - 1, j - 1
-        elif i > 0 and cost[i][j] == cost[i - 1][j] + 1:
-            ops.append(("del", ref[i - 1], None))
-            i -= 1
-        else:
-            ops.append(("ins", None, hyp[j - 1]))
-            j -= 1
-    ops.reverse()
-
-    s = sum(1 for t, _, _ in ops if t == "sub")
-    d = sum(1 for t, _, _ in ops if t == "del")
-    ins = sum(1 for t, _, _ in ops if t == "ins")
-    hits = sum(1 for t, _, _ in ops if t == "equal")
-    counts = Counts(substitutions=s, deletions=d, insertions=ins, hits=hits, ref_length=len(ref))
-    return counts, ops
-
-
-def _segments_from_ops(ops, joiner: str):
-    """Build colour-coded segments for the left (ref) and right (hyp) panels."""
-    left: List[Segment] = []
-    right: List[Segment] = []
-
-    def push(segments: List[Segment], text: str, status: Status):
-        if joiner and segments:
-            segments.append(Segment(text=joiner, status="match"))
-        segments.append(Segment(text=text, status=status))
-
-    for typ, ref_tok, hyp_tok in ops:
-        if typ == "equal":
-            push(left, ref_tok[1], "match")
-            push(right, hyp_tok[1], "match")
-        elif typ == "sub":
-            push(left, ref_tok[1], "error")
-            push(right, hyp_tok[1], "error")
-        elif typ == "del":
-            push(left, ref_tok[1], "error")
-        elif typ == "ins":
-            push(right, hyp_tok[1], "error")
-
-    return left, right
-
-
-def _merge_segments(segments: List[Segment]) -> List[Segment]:
-    """Collapse adjacent segments with the same status for a smaller payload."""
-    merged: List[Segment] = []
-    for seg in segments:
-        if merged and merged[-1].status == seg.status:
-            merged[-1] = Segment(text=merged[-1].text + seg.text, status=seg.status)
-        else:
-            merged.append(Segment(text=seg.text, status=seg.status))
-    return merged
-
-
+# --------------------------------------------------------------------------- #
+# Tokenization + normalization
+# --------------------------------------------------------------------------- #
 def _norm_key(s: str, ignore_case: bool, ignore_punct: bool) -> str:
     if ignore_case:
         s = s.lower()
@@ -175,8 +64,7 @@ def _word_tokens(text: str, ignore_case: bool, ignore_punct: bool) -> List[Token
     for w in text.split():
         key = _norm_key(w, ignore_case, ignore_punct)
         if ignore_punct and key == "":
-            # Pure-punctuation token; ignored entirely when stripping punctuation.
-            continue
+            continue  # pure-punctuation token ignored when stripping punctuation
         tokens.append((key, w))
     return tokens
 
@@ -191,45 +79,157 @@ def _char_tokens(text: str, ignore_case: bool, ignore_punct: bool) -> List[Token
     return tokens
 
 
+def _encode(ref_keys: List[str], hyp_keys: List[str]) -> Tuple[str, str]:
+    """
+    Map each distinct token key to a single Unicode code point so we can run
+    rapidfuzz's fast string Levenshtein on word tokens too (not just chars).
+    Unique keys per document pair are far below the Unicode limit.
+    """
+    mapping: dict = {}
+
+    def enc(seq: List[str]) -> str:
+        return "".join(mapping.setdefault(k, chr(len(mapping))) for k in seq)
+
+    return enc(ref_keys), enc(hyp_keys)
+
+
+# --------------------------------------------------------------------------- #
+# Alignment -> coloured segments
+# --------------------------------------------------------------------------- #
+def _segments(ref_tokens, hyp_tokens, ops, joiner: str):
+    """Walk editops to build coloured segments for the left/right panels."""
+    left: List[list] = []
+    right: List[list] = []
+
+    def push(arr, text, status):
+        if joiner and arr:
+            arr.append([joiner, "match"])
+        arr.append([text, status])
+
+    i = j = 0
+    for op in ops:
+        sp, dp = op.src_pos, op.dest_pos
+        while i < sp:
+            push(left, ref_tokens[i][1], "match")
+            i += 1
+        while j < dp:
+            push(right, hyp_tokens[j][1], "match")
+            j += 1
+        if op.tag == "replace":
+            push(left, ref_tokens[i][1], "error")
+            push(right, hyp_tokens[j][1], "error")
+            i += 1
+            j += 1
+        elif op.tag == "delete":
+            push(left, ref_tokens[i][1], "error")
+            i += 1
+        elif op.tag == "insert":
+            push(right, hyp_tokens[j][1], "error")
+            j += 1
+    while i < len(ref_tokens):
+        push(left, ref_tokens[i][1], "match")
+        i += 1
+    while j < len(hyp_tokens):
+        push(right, hyp_tokens[j][1], "match")
+        j += 1
+
+    return _merge(left), _merge(right)
+
+
+def _merge(segments: List[list]) -> List[dict]:
+    """Collapse adjacent same-status segments for a smaller payload."""
+    out: List[dict] = []
+    for text, status in segments:
+        if out and out[-1]["status"] == status:
+            out[-1]["text"] += text
+        else:
+            out.append({"text": text, "status": status})
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Per-level evaluation
+# --------------------------------------------------------------------------- #
+def _eval_level(ref_tokens, hyp_tokens, align_max: int, joiner: str) -> dict:
+    ref_keys = [t[0] for t in ref_tokens]
+    hyp_keys = [t[0] for t in hyp_tokens]
+    rs, hs = _encode(ref_keys, hyp_keys)
+
+    distance = Levenshtein.distance(rs, hs)
+    n = len(ref_tokens)
+    if n == 0:
+        rate = 0.0 if distance == 0 else 1.0
+    else:
+        rate = distance / n
+    accuracy = max(0.0, 1.0 - rate)
+
+    result = {
+        "error_rate": rate,
+        "accuracy": accuracy,
+        "distance": distance,
+        "ref_length": n,
+        "hyp_length": len(hyp_tokens),
+        "included": False,
+        "truncated": False,
+        "preview_limit": None,
+        "counts": None,
+        "alignment": None,
+    }
+
+    big = max(len(rs), len(hs))
+    if big <= align_max:
+        # Full alignment with exact substitution/deletion/insertion split.
+        ops = Levenshtein.editops(rs, hs)
+        sub = sum(1 for op in ops if op.tag == "replace")
+        dele = sum(1 for op in ops if op.tag == "delete")
+        ins = sum(1 for op in ops if op.tag == "insert")
+        left, right = _segments(ref_tokens, hyp_tokens, ops, joiner)
+        result["included"] = True
+        result["counts"] = {
+            "substitutions": sub,
+            "deletions": dele,
+            "insertions": ins,
+            "hits": n - sub - dele,
+        }
+        result["alignment"] = {"left": left, "right": right}
+    else:
+        # Too large for a full alignment: exact scores stand, show a preview.
+        rt = ref_tokens[:align_max]
+        ht = hyp_tokens[:align_max]
+        ops = Levenshtein.editops(rs[:align_max], hs[:align_max])
+        left, right = _segments(rt, ht, ops, joiner)
+        result["truncated"] = True
+        result["preview_limit"] = align_max
+        result["alignment"] = {"left": left, "right": right}
+
+    return result
+
+
 def evaluate(
     ground_truth: str,
     ocr_text: str,
     ignore_case: bool = False,
     ignore_punct: bool = False,
 ) -> dict:
-    """Compute CER, WER, accuracies and both alignments."""
-    # ---- Word level (WER) ----
-    ref_words = _word_tokens(ground_truth, ignore_case, ignore_punct)
-    hyp_words = _word_tokens(ocr_text, ignore_case, ignore_punct)
-    word_counts, word_ops = _align(ref_words, hyp_words)
-    word_left, word_right = _segments_from_ops(word_ops, joiner=" ")
-
-    # ---- Character level (CER) ----
-    ref_chars = _char_tokens(ground_truth, ignore_case, ignore_punct)
-    hyp_chars = _char_tokens(ocr_text, ignore_case, ignore_punct)
-    char_counts, char_ops = _align(ref_chars, hyp_chars)
-    char_left, char_right = _segments_from_ops(char_ops, joiner="")
-
-    def counts_dict(c: Counts) -> dict:
-        return {
-            "substitutions": c.substitutions,
-            "deletions": c.deletions,
-            "insertions": c.insertions,
-            "hits": c.hits,
-            "ref_length": c.ref_length,
-            "errors": c.errors,
-        }
-
-    def segs(segments: List[Segment]) -> List[dict]:
-        return [{"text": s.text, "status": s.status} for s in _merge_segments(segments)]
+    """Compute CER, WER, accuracies and (where feasible) alignments."""
+    word = _eval_level(
+        _word_tokens(ground_truth, ignore_case, ignore_punct),
+        _word_tokens(ocr_text, ignore_case, ignore_punct),
+        WORD_ALIGN_MAX,
+        joiner=" ",
+    )
+    char = _eval_level(
+        _char_tokens(ground_truth, ignore_case, ignore_punct),
+        _char_tokens(ocr_text, ignore_case, ignore_punct),
+        CHAR_ALIGN_MAX,
+        joiner="",
+    )
 
     return {
-        "wer": word_counts.error_rate,
-        "cer": char_counts.error_rate,
-        "word_accuracy": word_counts.accuracy,
-        "char_accuracy": char_counts.accuracy,
-        "word_counts": counts_dict(word_counts),
-        "char_counts": counts_dict(char_counts),
-        "word_alignment": {"left": segs(word_left), "right": segs(word_right)},
-        "char_alignment": {"left": segs(char_left), "right": segs(char_right)},
+        "cer": char["error_rate"],
+        "wer": word["error_rate"],
+        "char_accuracy": char["accuracy"],
+        "word_accuracy": word["accuracy"],
+        "char": char,
+        "word": word,
     }

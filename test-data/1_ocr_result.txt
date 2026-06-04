@@ -1,0 +1,3 @@
+The qulck brown fox jumps over the lazy dog.
+Handwriten notes are often dificult to read.
+Optical character recognltion is not always perfect.

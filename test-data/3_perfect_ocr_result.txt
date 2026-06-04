@@ -1,0 +1,2 @@
+This text is identical on both sides.
+It should produce zero errors and one hundred percent accuracy.
