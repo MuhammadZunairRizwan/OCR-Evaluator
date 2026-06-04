@@ -1,21 +1,36 @@
-# OCR CER / WER Comparison Tool
+# NARA · CER / WER OCR Evaluator
 
-Evaluate OCR output against human ground-truth transcriptions. Computes
-**CER** (Character Error Rate) and **WER** (Word Error Rate), and shows a
-side-by-side comparison where matches are **green** and errors are **red**.
+Evaluate OCR output (NARA / National Archives records) against human
+ground-truth transcriptions. You provide two CSVs and look records up by
+**NAID** (National Archives ID); the app computes **CER** (Character Error Rate)
+and **WER** (Word Error Rate) and shows a side-by-side comparison where matches
+are **green** and errors are **red**.
 
-- **Frontend:** React + Vite (deploy to Vercel)
-- **Backend:** FastAPI (deploy to Render / Railway)
+- **Frontend:** React + Vite (Vercel or Render Static Site)
+- **Backend:** FastAPI + [rapidfuzz](https://github.com/rapidfuzz/RapidFuzz) (Render / Railway)
+
+## Workflow
+
+1. Upload the two CSVs (parsed entirely in your browser — they never leave your machine):
+   - `naid_transcriptions.csv` — columns `naId, transcriptionText` (ground truth)
+   - `ocr_extraction.csv` — columns `naId, extracted_text` (OCR output)
+2. Type a **NAID** (or hit **Random**) and click **View record**.
+3. The app finds that NAID in both CSVs, shows both texts, and computes CER/WER.
+
+The app ships with a small **demo dataset** so it works before any upload;
+loading both CSVs unlocks all records.
 
 ## Features
 
-- Two text boxes — **Ground Truth** (left) and **OCR Result** (right)
-- Upload `.txt` files **or** edit/paste text manually
+- **NAID lookup** across two CSVs, with a **Random** record button
 - CER, WER, and accuracy (1 − error rate) scores
 - Word-level and character-level error breakdown (substitutions / deletions / insertions / hits)
 - Toggle highlighting between **word** and **character** alignment
 - **Ignore case** / **Ignore punctuation** toggles to match how "correct" is graded (re-scores live)
 - Side-by-side colour-coded diff for verification
+- **Handles very large documents** (200k+ characters): exact scores are always
+  computed; the green/red diff falls back to a truncated preview + plain-text
+  view when a document is too large to align in full
 
 ## How the metrics are computed
 
@@ -29,8 +44,18 @@ CER = (S + D + I) / N   over characters
 
 where `S` = substitutions, `D` = deletions, `I` = insertions, and `N` = number
 of tokens in the ground truth. Accuracy is reported as `1 − error rate`.
-The same alignment produces the green/red highlighting, so the colours always
-match the score.
+
+The distance is computed with **rapidfuzz** (C-backed) so even 235k-character
+records score in a couple of seconds. The same alignment produces the green/red
+highlighting; for documents above `CHAR_ALIGN_MAX` (20k chars) / `WORD_ALIGN_MAX`
+(8k words) the exact split is omitted and a truncated preview is shown instead
+(scores still cover the full document).
+
+## Big data note
+
+The real CSVs (~105 MB combined, 2,260 records) are **not** committed to the
+repo — they're git-ignored under `test-data/`. CSV parsing and NAID matching
+happen client-side; only the selected record's two texts are sent to the backend.
 
 ---
 
