@@ -11,24 +11,30 @@ where, comparing the OCR hypothesis against the ground-truth reference:
 
 Accuracy is 1 - error-rate (clamped to 0).
 
+Display units
+-------------
+Each side is tokenized into a list of *units*, where a unit is
+``(display, key)``:
+
+    * ``display`` is the original text shown in the side-by-side view.
+    * ``key`` is what gets compared, or ``None`` for an **ignored** unit.
+
+Ignored units (e.g. whitespace when "ignore space" is on, or the spaces
+*between* words) are still rendered — shown as **neutral** (no green/red) — but
+they take no part in the alignment or the score. This is why turning on
+"ignore space" keeps the spaces visible yet stops them counting as errors.
+
 Scale
 -----
-NARA documents can be very large (200k+ characters). A naive O(n*m) DP matrix
-is impossible at that size, so the edit *distance* (which is all CER/WER need)
-is computed with rapidfuzz's C-backed Levenshtein in linear memory — fast even
-for the biggest records.
+NARA documents can be very large (200k+ characters). The edit *distance* (all
+CER/WER need) is computed with rapidfuzz's C-backed Levenshtein in linear
+memory. The green/red alignment needs the full editops, which we compute only
+under a size threshold; above it the exact scores still stand and a truncated
+preview of the alignment is returned.
 
-The green/red side-by-side highlighting needs the full alignment (editops). We
-always produce it for documents under a size threshold. For larger documents we
-still report the exact full-document scores, plus a *truncated preview* of the
-alignment (first N tokens) so there is something to eyeball; the precise
-substitution/deletion/insertion split is omitted in that case.
-
-Normalization
--------------
-Tokens carry a `display` string (original text, for highlighting) and a `key`
-string (for comparison). `ignore_case` / `ignore_punct` only affect the key, so
-the diff always shows real text while the score reflects the chosen leniency.
+Normalization keys only — `ignore_case` / `ignore_punct` / `ignore_space` /
+`ignore_newline` change the comparison key (or mark a unit ignored), never the
+displayed text.
 """
 
 from __future__ import annotations
@@ -39,67 +45,70 @@ from typing import List, Optional, Tuple
 from rapidfuzz.distance import Levenshtein
 
 _PUNCT = set(string.punctuation)
+_SPACE = {" ", "\t"}
+_NEWLINE = {"\n", "\r"}
 
 # Above these sizes we skip the full alignment and show a truncated preview.
-CHAR_ALIGN_MAX = 20000   # characters
-WORD_ALIGN_MAX = 8000    # words
+CHAR_ALIGN_MAX = 20000   # compared characters
+WORD_ALIGN_MAX = 8000    # compared words
 
-# A token is (key, display).
-Token = Tuple[str, str]
+# A unit is (display, key); key is None when the unit is ignored (neutral).
+Unit = Tuple[str, Optional[str]]
 
 
 # --------------------------------------------------------------------------- #
-# Tokenization + normalization
+# Tokenization into display units
 # --------------------------------------------------------------------------- #
-def _norm_key(s: str, ignore_case: bool, ignore_punct: bool) -> str:
+def _norm_word_key(w: str, ignore_case: bool, ignore_punct: bool) -> str:
     if ignore_case:
-        s = s.lower()
+        w = w.lower()
     if ignore_punct:
-        s = "".join(c for c in s if c not in _PUNCT)
-    return s
+        w = "".join(c for c in w if c not in _PUNCT)
+    return w
 
 
-def _word_tokens(text: str, ignore_case: bool, ignore_punct: bool) -> List[Token]:
-    # Word tokenization already drops all whitespace (space/tab/newline) via
-    # str.split(), so ignore_space / ignore_newline have no effect at word level.
-    tokens: List[Token] = []
+def _word_units(text: str, ignore_case: bool, ignore_punct: bool) -> List[Unit]:
+    """Words become compared units; the single space between them is neutral."""
+    units: List[Unit] = []
+    first = True
     for w in text.split():
-        key = _norm_key(w, ignore_case, ignore_punct)
+        if not first:
+            units.append((" ", None))  # neutral separator (shown, not compared)
+        first = False
+        key = _norm_word_key(w, ignore_case, ignore_punct)
         if ignore_punct and key == "":
-            continue  # pure-punctuation token ignored when stripping punctuation
-        tokens.append((key, w))
-    return tokens
+            units.append((w, None))  # pure-punctuation word: shown, not compared
+        else:
+            units.append((w, key))
+    return units
 
 
-def _char_tokens(
+def _char_units(
     text: str,
     ignore_case: bool,
     ignore_punct: bool,
     ignore_space: bool,
     ignore_newline: bool,
-) -> List[Token]:
-    skip: set = set()
-    if ignore_punct:
-        skip |= _PUNCT
-    if ignore_space:
-        skip |= {" ", "\t"}
-    if ignore_newline:
-        skip |= {"\n", "\r"}
-    tokens: List[Token] = []
+) -> List[Unit]:
+    units: List[Unit] = []
     for c in text:
-        if c in skip:
-            continue
-        key = c.lower() if ignore_case else c
-        tokens.append((key, c))
-    return tokens
+        ignored = (
+            (ignore_punct and c in _PUNCT)
+            or (ignore_space and c in _SPACE)
+            or (ignore_newline and c in _NEWLINE)
+        )
+        if ignored:
+            units.append((c, None))  # shown as neutral, not compared
+        else:
+            units.append((c, c.lower() if ignore_case else c))
+    return units
 
 
+# --------------------------------------------------------------------------- #
+# Alignment helpers
+# --------------------------------------------------------------------------- #
 def _encode(ref_keys: List[str], hyp_keys: List[str]) -> Tuple[str, str]:
-    """
-    Map each distinct token key to a single Unicode code point so we can run
-    rapidfuzz's fast string Levenshtein on word tokens too (not just chars).
-    Unique keys per document pair are far below the Unicode limit.
-    """
+    """Map each distinct key to one code point so rapidfuzz can run on words too."""
     mapping: dict = {}
 
     def enc(seq: List[str]) -> str:
@@ -108,70 +117,64 @@ def _encode(ref_keys: List[str], hyp_keys: List[str]) -> Tuple[str, str]:
     return enc(ref_keys), enc(hyp_keys)
 
 
-# --------------------------------------------------------------------------- #
-# Alignment -> coloured segments
-# --------------------------------------------------------------------------- #
-def _segments(ref_tokens, hyp_tokens, ops, joiner: str):
-    """Walk editops to build coloured segments for the left/right panels."""
-    left: List[list] = []
-    right: List[list] = []
-
-    def push(arr, text, status):
-        if joiner and arr:
-            arr.append([joiner, "match"])
-        arr.append([text, status])
-
-    i = j = 0
+def _statuses(n_ref: int, n_hyp: int, ops) -> Tuple[List[str], List[str]]:
+    """Per-compared-token status (match/error) for each side, from editops."""
+    ref = ["match"] * n_ref
+    hyp = ["match"] * n_hyp
     for op in ops:
-        sp, dp = op.src_pos, op.dest_pos
-        while i < sp:
-            push(left, ref_tokens[i][1], "match")
-            i += 1
-        while j < dp:
-            push(right, hyp_tokens[j][1], "match")
-            j += 1
         if op.tag == "replace":
-            push(left, ref_tokens[i][1], "error")
-            push(right, hyp_tokens[j][1], "error")
-            i += 1
-            j += 1
+            ref[op.src_pos] = "error"
+            hyp[op.dest_pos] = "error"
         elif op.tag == "delete":
-            push(left, ref_tokens[i][1], "error")
-            i += 1
+            ref[op.src_pos] = "error"
         elif op.tag == "insert":
-            push(right, hyp_tokens[j][1], "error")
-            j += 1
-    while i < len(ref_tokens):
-        push(left, ref_tokens[i][1], "match")
-        i += 1
-    while j < len(hyp_tokens):
-        push(right, hyp_tokens[j][1], "match")
-        j += 1
-
-    return _merge(left), _merge(right)
+            hyp[op.dest_pos] = "error"
+    return ref, hyp
 
 
-def _merge(segments: List[list]) -> List[dict]:
-    """Collapse adjacent same-status segments for a smaller payload."""
-    out: List[dict] = []
-    for text, status in segments:
-        if out and out[-1]["status"] == status:
-            out[-1]["text"] += text
+def _segments(units: List[Unit], statuses: List[str]) -> List[dict]:
+    """
+    Walk display units, colouring compared ones by their status and rendering
+    ignored ones as neutral. Adjacent same-status runs are merged.
+    """
+    segs: List[dict] = []
+    si = 0
+    for display, key in units:
+        if key is None:
+            status = "neutral"
         else:
-            out.append({"text": text, "status": status})
+            status = statuses[si]
+            si += 1
+        if segs and segs[-1]["status"] == status:
+            segs[-1]["text"] += display
+        else:
+            segs.append({"text": display, "status": status})
+    return segs
+
+
+def _prefix_units(units: List[Unit], max_compared: int) -> List[Unit]:
+    """First slice of units containing up to `max_compared` compared tokens."""
+    out: List[Unit] = []
+    c = 0
+    for u in units:
+        if u[1] is not None:
+            if c >= max_compared:
+                break
+            c += 1
+        out.append(u)
     return out
 
 
 # --------------------------------------------------------------------------- #
 # Per-level evaluation
 # --------------------------------------------------------------------------- #
-def _eval_level(ref_tokens, hyp_tokens, align_max: int, joiner: str) -> dict:
-    ref_keys = [t[0] for t in ref_tokens]
-    hyp_keys = [t[0] for t in hyp_tokens]
+def _eval_level(ref_units: List[Unit], hyp_units: List[Unit], align_max: int) -> dict:
+    ref_keys = [k for _, k in ref_units if k is not None]
+    hyp_keys = [k for _, k in hyp_units if k is not None]
     rs, hs = _encode(ref_keys, hyp_keys)
 
     distance = Levenshtein.distance(rs, hs)
-    n = len(ref_tokens)
+    n = len(ref_keys)
     if n == 0:
         rate = 0.0 if distance == 0 else 1.0
     else:
@@ -183,7 +186,7 @@ def _eval_level(ref_tokens, hyp_tokens, align_max: int, joiner: str) -> dict:
         "accuracy": accuracy,
         "distance": distance,
         "ref_length": n,
-        "hyp_length": len(hyp_tokens),
+        "hyp_length": len(hyp_keys),
         "included": False,
         "truncated": False,
         "preview_limit": None,
@@ -191,14 +194,12 @@ def _eval_level(ref_tokens, hyp_tokens, align_max: int, joiner: str) -> dict:
         "alignment": None,
     }
 
-    big = max(len(rs), len(hs))
-    if big <= align_max:
-        # Full alignment with exact substitution/deletion/insertion split.
+    if max(len(rs), len(hs)) <= align_max:
         ops = Levenshtein.editops(rs, hs)
         sub = sum(1 for op in ops if op.tag == "replace")
         dele = sum(1 for op in ops if op.tag == "delete")
         ins = sum(1 for op in ops if op.tag == "insert")
-        left, right = _segments(ref_tokens, hyp_tokens, ops, joiner)
+        ref_status, hyp_status = _statuses(n, len(hyp_keys), ops)
         result["included"] = True
         result["counts"] = {
             "substitutions": sub,
@@ -206,16 +207,24 @@ def _eval_level(ref_tokens, hyp_tokens, align_max: int, joiner: str) -> dict:
             "insertions": ins,
             "hits": n - sub - dele,
         }
-        result["alignment"] = {"left": left, "right": right}
+        result["alignment"] = {
+            "left": _segments(ref_units, ref_status),
+            "right": _segments(hyp_units, hyp_status),
+        }
     else:
         # Too large for a full alignment: exact scores stand, show a preview.
-        rt = ref_tokens[:align_max]
-        ht = hyp_tokens[:align_max]
+        ru = _prefix_units(ref_units, align_max)
+        hu = _prefix_units(hyp_units, align_max)
+        n_ref_p = sum(1 for _, k in ru if k is not None)
+        n_hyp_p = sum(1 for _, k in hu if k is not None)
         ops = Levenshtein.editops(rs[:align_max], hs[:align_max])
-        left, right = _segments(rt, ht, ops, joiner)
+        ref_status, hyp_status = _statuses(n_ref_p, n_hyp_p, ops)
         result["truncated"] = True
         result["preview_limit"] = align_max
-        result["alignment"] = {"left": left, "right": right}
+        result["alignment"] = {
+            "left": _segments(ru, ref_status),
+            "right": _segments(hu, hyp_status),
+        }
 
     return result
 
@@ -230,16 +239,14 @@ def evaluate(
 ) -> dict:
     """Compute CER, WER, accuracies and (where feasible) alignments."""
     word = _eval_level(
-        _word_tokens(ground_truth, ignore_case, ignore_punct),
-        _word_tokens(ocr_text, ignore_case, ignore_punct),
+        _word_units(ground_truth, ignore_case, ignore_punct),
+        _word_units(ocr_text, ignore_case, ignore_punct),
         WORD_ALIGN_MAX,
-        joiner=" ",
     )
     char = _eval_level(
-        _char_tokens(ground_truth, ignore_case, ignore_punct, ignore_space, ignore_newline),
-        _char_tokens(ocr_text, ignore_case, ignore_punct, ignore_space, ignore_newline),
+        _char_units(ground_truth, ignore_case, ignore_punct, ignore_space, ignore_newline),
+        _char_units(ocr_text, ignore_case, ignore_punct, ignore_space, ignore_newline),
         CHAR_ALIGN_MAX,
-        joiner="",
     )
 
     return {

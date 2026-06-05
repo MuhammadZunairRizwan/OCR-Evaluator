@@ -285,6 +285,13 @@ button.primary:hover {
   font-weight: 600;
 }
 
+/* Ignored units (e.g. spaces/newlines when "ignore space" is on): shown but
+   not scored — neutral, no highlight. */
+.seg-neutral {
+  background: transparent;
+  color: var(--text);
+}
+
 footer {
   margin-top: 40px;
   text-align: center;

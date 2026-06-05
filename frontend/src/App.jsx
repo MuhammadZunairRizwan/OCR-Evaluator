@@ -10,11 +10,13 @@ const fmt = (n) => n.toLocaleString();
 const DEMO_GT = new Map(DEMO_RECORDS.map((r) => [r.naId, r.gt]));
 const DEMO_OCR = new Map(DEMO_RECORDS.map((r) => [r.naId, r.ocr]));
 
+const SEG_CLASS = { error: "seg-error", neutral: "seg-neutral", match: "seg-match" };
+
 function HighlightView({ segments }) {
   return (
     <pre className="highlight">
       {segments.map((seg, i) => (
-        <span key={i} className={seg.status === "error" ? "seg-error" : "seg-match"}>
+        <span key={i} className={SEG_CLASS[seg.status] || "seg-match"}>
           {seg.text}
         </span>
       ))}
