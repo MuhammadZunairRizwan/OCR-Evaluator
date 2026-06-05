@@ -38,7 +38,8 @@ class EvaluateRequest(BaseModel):
     ignore_punct: bool = False
     ignore_space: bool = False
     ignore_newline: bool = False
-    align: bool = False  # also return the line-by-line horizontal alignment
+    align: bool = False  # also return the horizontal alignment
+    align_level: str = "word"  # "word" or "char" colouring for the aligned view
 
 
 @app.get("/")
@@ -56,5 +57,7 @@ def api_evaluate(req: EvaluateRequest):
     )
     result = evaluate(req.ground_truth, req.ocr_text, **norm)
     if req.align:
-        result["aligned"] = align_lines(req.ground_truth, req.ocr_text, **norm)
+        result["aligned"] = align_lines(
+            req.ground_truth, req.ocr_text, level=req.align_level, **norm
+        )
     return result

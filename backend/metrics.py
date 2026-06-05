@@ -262,6 +262,41 @@ def _row_segs(words):
     return segs
 
 
+def _char_all(text: str, ic, ip, isp, inl, status: str):
+    """Char segments for one side of a filler/identical row (ignored chars neutral)."""
+    segs: List[dict] = []
+    for disp, key in _char_units(text, ic, ip, isp, inl):
+        st = "neutral" if key is None else status
+        if segs and segs[-1]["status"] == st:
+            segs[-1]["text"] += disp
+        else:
+            segs.append({"text": disp, "status": st})
+    return segs
+
+
+def _row_char(lw, rw, ic, ip, isp, inl):
+    """Character-level colouring for a row, given its left/right word lists."""
+    lt = None if lw is None else " ".join(w for w, _ in lw)
+    rt = None if rw is None else " ".join(w for w, _ in rw)
+    if lt is None:
+        return None, _char_all(rt, ic, ip, isp, inl, "error")
+    if rt is None:
+        return _char_all(lt, ic, ip, isp, inl, "error"), None
+    if lt == rt:
+        return (
+            _char_all(lt, ic, ip, isp, inl, "match"),
+            _char_all(rt, ic, ip, isp, inl, "match"),
+        )
+    lu = _char_units(lt, ic, ip, isp, inl)
+    ru = _char_units(rt, ic, ip, isp, inl)
+    lk = [k for _, k in lu if k is not None]
+    rk = [k for _, k in ru if k is not None]
+    rs, hs = _encode(lk, rk)
+    ops = Levenshtein.editops(rs, hs)
+    ls, rss = _statuses(len(lk), len(rk), ops)
+    return _segments(lu, ls), _segments(ru, rss)
+
+
 def align_lines(
     ground_truth: str,
     ocr_text: str,
@@ -269,6 +304,7 @@ def align_lines(
     ignore_punct: bool = False,
     ignore_space: bool = False,
     ignore_newline: bool = False,
+    level: str = "word",
 ) -> dict:
     """
     Word-alignment-driven side-by-side layout.
@@ -278,8 +314,11 @@ def align_lines(
     the global word diff: long runs of matching words become shared "anchor"
     rows that keep the two columns in sync, and the changes between anchors are
     grouped into aligned blocks. A block present on only one side gets a blank
-    (yellow) filler opposite. Colouring is the same global word diff that
-    produces the WER, so the red always matches the score.
+    (yellow) filler opposite.
+
+    The *layout* is always word-anchored; the *colouring* follows `level`:
+    "word" colours whole words (matching the WER), "char" diffs each row at the
+    character level so only the differing characters within a word are red.
     """
     g = _words_for_align(ground_truth, ignore_case, ignore_punct)
     o = _words_for_align(ocr_text, ignore_case, ignore_punct)
@@ -321,7 +360,8 @@ def align_lines(
         else:
             runs.append([kind, [it]])
 
-    rows = []
+    # Build raw rows as left/right word lists (None = blank filler side).
+    raw = []
 
     def emit_diff(buf):
         if not buf:
@@ -338,22 +378,35 @@ def align_lines(
                 left.append((gw, "error"))
             else:
                 right.append((ow, "error"))
-        rows.append({"left": _row_segs(left), "right": _row_segs(right)})
+        raw.append({"left": left or None, "right": right or None})
 
     buf = []
     for kind, its in runs:
         if kind == "equal" and len(its) >= _ANCHOR_MIN:
             emit_diff(buf)
             buf = []
-            rows.append(
+            raw.append(
                 {
-                    "left": _row_segs([(gw, "match") for _, gw, _ in its]),
-                    "right": _row_segs([(ow, "match") for _, _, ow in its]),
+                    "left": [(gw, "match") for _, gw, _ in its],
+                    "right": [(ow, "match") for _, _, ow in its],
                 }
             )
         else:
             buf.extend(its)
     emit_diff(buf)
+
+    # Render rows at the requested granularity.
+    rows = []
+    if level == "char":
+        for r in raw:
+            left, right = _row_char(
+                r["left"], r["right"],
+                ignore_case, ignore_punct, ignore_space, ignore_newline,
+            )
+            rows.append({"left": left, "right": right})
+    else:
+        for r in raw:
+            rows.append({"left": _row_segs(r["left"]), "right": _row_segs(r["right"])})
 
     return {"available": True, "rows": rows}
 

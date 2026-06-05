@@ -127,11 +127,11 @@ export default function App() {
     return ids;
   }, [gtMap, ocrMap]);
 
-  const runEval = async (gt, ocr, normObj, align) => {
+  const runEval = async (gt, ocr, normObj, align, level) => {
     setError("");
     setLoading(true);
     try {
-      const data = await evaluate(gt, ocr, { ...normObj, align });
+      const data = await evaluate(gt, ocr, { ...normObj, align, alignLevel: level });
       setResult(data);
     } catch (e) {
       setError(e.message || "Failed to evaluate. Is the backend awake?");
@@ -160,7 +160,7 @@ export default function App() {
 
     setCurrent({ naId, gt, ocr });
     setShowPlain(false);
-    runEval(gt, ocr, norm, alignView);
+    runEval(gt, ocr, norm, alignView, mode);
   };
 
   const random = () => {
@@ -173,13 +173,19 @@ export default function App() {
   const toggleNorm = (key) => {
     const next = { ...norm, [key]: !norm[key] };
     setNorm(next);
-    if (current) runEval(current.gt, current.ocr, next, alignView);
+    if (current) runEval(current.gt, current.ocr, next, alignView, mode);
   };
 
   const toggleAlign = () => {
     const next = !alignView;
     setAlignView(next);
-    if (current) runEval(current.gt, current.ocr, norm, next);
+    if (current) runEval(current.gt, current.ocr, norm, next, mode);
+  };
+
+  const changeMode = (m) => {
+    setMode(m);
+    // The aligned view is colour-rendered on the server, so re-fetch on mode change.
+    if (current && alignView) runEval(current.gt, current.ocr, norm, true, m);
   };
 
   const handleCsv = async (file, side) => {
@@ -344,15 +350,13 @@ export default function App() {
             <span>Highlight by:</span>
             <button
               className={mode === "word" ? "active" : ""}
-              onClick={() => setMode("word")}
-              disabled={showAligned}
+              onClick={() => changeMode("word")}
             >
               Word
             </button>
             <button
               className={mode === "char" ? "active" : ""}
-              onClick={() => setMode("char")}
-              disabled={showAligned}
+              onClick={() => changeMode("char")}
             >
               Character
             </button>

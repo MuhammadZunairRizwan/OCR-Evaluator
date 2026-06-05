@@ -15,6 +15,7 @@ export async function evaluate(groundTruth, ocrText, options = {}) {
       ignore_space: !!options.ignoreSpace,
       ignore_newline: !!options.ignoreNewline,
       align: !!options.align,
+      align_level: options.alignLevel || "word",
     }),
   });
   if (!res.ok) {
