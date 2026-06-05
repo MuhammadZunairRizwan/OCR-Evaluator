@@ -232,53 +232,34 @@ def _eval_level(ref_units: List[Unit], hyp_units: List[Unit], align_max: int) ->
 # --------------------------------------------------------------------------- #
 # Horizontal (line-by-line) alignment for the side-by-side view
 # --------------------------------------------------------------------------- #
-# Cap the line-alignment DP so it stays fast; above this we report unavailable.
-LINE_ALIGN_MAX_CELLS = 300_000
-_LINE_GAP = -0.4  # penalty for leaving a line unpaired (insert/delete)
+# Above this many words on a side, the aligned view is unavailable.
+ALIGN_MAX_WORDS = 60_000
+# A run of matching words this long becomes its own shared "anchor" row; shorter
+# matching runs are absorbed into the surrounding diff block.
+_ANCHOR_MIN = 3
 
 
-def _line_key(s: str, ic: bool, ip: bool, isp: bool) -> str:
-    if ic:
-        s = s.lower()
-    if ip:
-        s = "".join(c for c in s if c not in _PUNCT)
-    if isp:
-        s = s.replace(" ", "").replace("\t", "")
-    return s.strip()
+def _words_for_align(text: str, ic: bool, ip: bool) -> List[Token]:
+    """(display, key) per word. Whitespace is dropped — the layout is re-flowed."""
+    return [(w, _norm_word_key(w, ic, ip)) for w in text.split()]
 
 
-def _line_sim(a: str, b: str) -> float:
-    if a == b:
-        return 1.0
-    return Levenshtein.normalized_similarity(a, b)
-
-
-def _line_word_data(text: str, ic: bool, ip: bool):
-    """Split into lines and per-line word units; also the flat compared-word keys."""
-    lines = [x.rstrip("\r") for x in text.split("\n")]
-    line_units = [_word_units(ln, ic, ip) for ln in lines]
-    flat_keys = [k for units in line_units for _, k in units if k is not None]
-    return lines, line_units, flat_keys
-
-
-def _color_lines(line_units: List[List[Unit]], statuses: List[str]) -> List[List[dict]]:
-    """Colour each line's words by their position in the GLOBAL word status list."""
-    out: List[List[dict]] = []
-    idx = 0
-    for units in line_units:
-        segs: List[dict] = []
-        for display, key in units:
-            if key is None:
-                status = "neutral"
+def _row_segs(words):
+    """Merge (word, status) pairs into segments, neutral single spaces between."""
+    if not words:
+        return None  # nothing on this side -> blank (yellow) filler
+    segs: List[dict] = []
+    for idx, (w, st) in enumerate(words):
+        if idx > 0:
+            if segs and segs[-1]["status"] == "neutral":
+                segs[-1]["text"] += " "
             else:
-                status = statuses[idx]
-                idx += 1
-            if segs and segs[-1]["status"] == status:
-                segs[-1]["text"] += display
-            else:
-                segs.append({"text": display, "status": status})
-        out.append(segs)
-    return out
+                segs.append({"text": " ", "status": "neutral"})
+        if segs and segs[-1]["status"] == st:
+            segs[-1]["text"] += w
+        else:
+            segs.append({"text": w, "status": st})
+    return segs
 
 
 def align_lines(
@@ -290,68 +271,89 @@ def align_lines(
     ignore_newline: bool = False,
 ) -> dict:
     """
-    Lay the two documents out line-by-line so matching blocks line up vertically.
+    Word-alignment-driven side-by-side layout.
 
-    * Line *structure* (which line pairs with which, where the blank yellow
-      fillers go) comes from a Needleman-Wunsch alignment over lines, matched
-      fuzzily by similarity so OCR errors don't break the pairing.
-    * Word *colouring* comes from the SAME global word alignment that produces
-      the WER, so the red/green in this view always agrees with the score.
+    The two sides usually have different line breaks (hand transcription vs OCR
+    paragraphs), so pairing original lines leaves big gaps. Instead we align on
+    the global word diff: long runs of matching words become shared "anchor"
+    rows that keep the two columns in sync, and the changes between anchors are
+    grouped into aligned blocks. A block present on only one side gets a blank
+    (yellow) filler opposite. Colouring is the same global word diff that
+    produces the WER, so the red always matches the score.
     """
-    g_lines, g_units, g_keys = _line_word_data(ground_truth, ignore_case, ignore_punct)
-    o_lines, o_units, o_keys = _line_word_data(ocr_text, ignore_case, ignore_punct)
-    n, m = len(g_lines), len(o_lines)
-    if n * m > LINE_ALIGN_MAX_CELLS:
+    g = _words_for_align(ground_truth, ignore_case, ignore_punct)
+    o = _words_for_align(ocr_text, ignore_case, ignore_punct)
+    if max(len(g), len(o)) > ALIGN_MAX_WORDS:
         return {"available": False, "reason": "too_large", "rows": []}
 
-    # ---- Global word colouring (identical to the WER alignment) ----
-    rs, hs = _encode(g_keys, o_keys)
+    rs, hs = _encode([k for _, k in g], [k for _, k in o])
     ops = Levenshtein.editops(rs, hs)
-    g_status, o_status = _statuses(len(g_keys), len(o_keys), ops)
-    g_segs = _color_lines(g_units, g_status)
-    o_segs = _color_lines(o_units, o_status)
 
-    # ---- Line structure (Needleman-Wunsch over line similarity) ----
-    gk = [_line_key(x, ignore_case, ignore_punct, ignore_space) for x in g_lines]
-    ok = [_line_key(x, ignore_case, ignore_punct, ignore_space) for x in o_lines]
+    # Expand editops into a full tagged item stream (equal/sub/del/ins).
+    items = []
+    i = j = 0
+    for op in ops:
+        while i < op.src_pos:
+            items.append(("equal", g[i][0], o[j][0]))
+            i += 1
+            j += 1
+        if op.tag == "replace":
+            items.append(("sub", g[i][0], o[j][0]))
+            i += 1
+            j += 1
+        elif op.tag == "delete":
+            items.append(("del", g[i][0], None))
+            i += 1
+        else:  # insert
+            items.append(("ins", None, o[j][0]))
+            j += 1
+    while i < len(g):
+        items.append(("equal", g[i][0], o[j][0]))
+        i += 1
+        j += 1
 
-    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
-    for i in range(1, n + 1):
-        dp[i][0] = dp[i - 1][0] + _LINE_GAP
-    for j in range(1, m + 1):
-        dp[0][j] = dp[0][j - 1] + _LINE_GAP
-    for i in range(1, n + 1):
-        gi = gk[i - 1]
-        row, prev = dp[i], dp[i - 1]
-        for j in range(1, m + 1):
-            pair = prev[j - 1] + (2 * _line_sim(gi, ok[j - 1]) - 1)
-            row[j] = max(pair, prev[j] + _LINE_GAP, row[j - 1] + _LINE_GAP)
-
-    line_ops = []
-    i, j = n, m
-    while i > 0 or j > 0:
-        if i > 0 and j > 0:
-            s = _line_sim(gk[i - 1], ok[j - 1])
-            if abs(dp[i][j] - (dp[i - 1][j - 1] + (2 * s - 1))) < 1e-9:
-                line_ops.append(("pair", i - 1, j - 1))
-                i, j = i - 1, j - 1
-                continue
-        if i > 0 and abs(dp[i][j] - (dp[i - 1][j] + _LINE_GAP)) < 1e-9:
-            line_ops.append(("del", i - 1, None))
-            i -= 1
+    # Group consecutive items into equal-runs vs diff-runs.
+    runs = []
+    for it in items:
+        kind = "equal" if it[0] == "equal" else "diff"
+        if runs and runs[-1][0] == kind:
+            runs[-1][1].append(it)
         else:
-            line_ops.append(("ins", None, j - 1))
-            j -= 1
-    line_ops.reverse()
+            runs.append([kind, [it]])
 
     rows = []
-    for tag, i0, j0 in line_ops:
-        if tag == "pair":
-            rows.append({"left": g_segs[i0], "right": o_segs[j0]})
-        elif tag == "del":
-            rows.append({"left": g_segs[i0], "right": None})
+
+    def emit_diff(buf):
+        if not buf:
+            return
+        left, right = [], []
+        for tag, gw, ow in buf:
+            if tag == "equal":
+                left.append((gw, "match"))
+                right.append((ow, "match"))
+            elif tag == "sub":
+                left.append((gw, "error"))
+                right.append((ow, "error"))
+            elif tag == "del":
+                left.append((gw, "error"))
+            else:
+                right.append((ow, "error"))
+        rows.append({"left": _row_segs(left), "right": _row_segs(right)})
+
+    buf = []
+    for kind, its in runs:
+        if kind == "equal" and len(its) >= _ANCHOR_MIN:
+            emit_diff(buf)
+            buf = []
+            rows.append(
+                {
+                    "left": _row_segs([(gw, "match") for _, gw, _ in its]),
+                    "right": _row_segs([(ow, "match") for _, _, ow in its]),
+                }
+            )
         else:
-            rows.append({"left": None, "right": o_segs[j0]})
+            buf.extend(its)
+    emit_diff(buf)
 
     return {"available": True, "rows": rows}
 
