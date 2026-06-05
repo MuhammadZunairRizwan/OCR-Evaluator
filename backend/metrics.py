@@ -60,6 +60,8 @@ def _norm_key(s: str, ignore_case: bool, ignore_punct: bool) -> str:
 
 
 def _word_tokens(text: str, ignore_case: bool, ignore_punct: bool) -> List[Token]:
+    # Word tokenization already drops all whitespace (space/tab/newline) via
+    # str.split(), so ignore_space / ignore_newline have no effect at word level.
     tokens: List[Token] = []
     for w in text.split():
         key = _norm_key(w, ignore_case, ignore_punct)
@@ -69,10 +71,23 @@ def _word_tokens(text: str, ignore_case: bool, ignore_punct: bool) -> List[Token
     return tokens
 
 
-def _char_tokens(text: str, ignore_case: bool, ignore_punct: bool) -> List[Token]:
+def _char_tokens(
+    text: str,
+    ignore_case: bool,
+    ignore_punct: bool,
+    ignore_space: bool,
+    ignore_newline: bool,
+) -> List[Token]:
+    skip: set = set()
+    if ignore_punct:
+        skip |= _PUNCT
+    if ignore_space:
+        skip |= {" ", "\t"}
+    if ignore_newline:
+        skip |= {"\n", "\r"}
     tokens: List[Token] = []
     for c in text:
-        if ignore_punct and c in _PUNCT:
+        if c in skip:
             continue
         key = c.lower() if ignore_case else c
         tokens.append((key, c))
@@ -210,6 +225,8 @@ def evaluate(
     ocr_text: str,
     ignore_case: bool = False,
     ignore_punct: bool = False,
+    ignore_space: bool = False,
+    ignore_newline: bool = False,
 ) -> dict:
     """Compute CER, WER, accuracies and (where feasible) alignments."""
     word = _eval_level(
@@ -219,8 +236,8 @@ def evaluate(
         joiner=" ",
     )
     char = _eval_level(
-        _char_tokens(ground_truth, ignore_case, ignore_punct),
-        _char_tokens(ocr_text, ignore_case, ignore_punct),
+        _char_tokens(ground_truth, ignore_case, ignore_punct, ignore_space, ignore_newline),
+        _char_tokens(ocr_text, ignore_case, ignore_punct, ignore_space, ignore_newline),
         CHAR_ALIGN_MAX,
         joiner="",
     )

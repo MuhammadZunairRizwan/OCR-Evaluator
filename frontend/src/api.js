@@ -12,6 +12,8 @@ export async function evaluate(groundTruth, ocrText, options = {}) {
       ocr_text: ocrText,
       ignore_case: !!options.ignoreCase,
       ignore_punct: !!options.ignorePunct,
+      ignore_space: !!options.ignoreSpace,
+      ignore_newline: !!options.ignoreNewline,
     }),
   });
   if (!res.ok) {

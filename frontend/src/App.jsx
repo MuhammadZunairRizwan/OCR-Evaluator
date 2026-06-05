@@ -65,8 +65,12 @@ export default function App() {
   const [current, setCurrent] = useState(null); // {naId, gt, ocr}
   const [result, setResult] = useState(null);
   const [mode, setMode] = useState("word");
-  const [ignoreCase, setIgnoreCase] = useState(false);
-  const [ignorePunct, setIgnorePunct] = useState(false);
+  const [norm, setNorm] = useState({
+    ignoreCase: false,
+    ignorePunct: false,
+    ignoreSpace: false,
+    ignoreNewline: false,
+  });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [showPlain, setShowPlain] = useState(false);
@@ -119,7 +123,7 @@ export default function App() {
 
     setCurrent({ naId, gt, ocr });
     setShowPlain(false);
-    runEval(gt, ocr, { ignoreCase, ignorePunct });
+    runEval(gt, ocr, norm);
   };
 
   const random = () => {
@@ -129,16 +133,10 @@ export default function App() {
     viewRecord(id);
   };
 
-  const onToggle = (which) => {
-    const next = which === "case" ? !ignoreCase : !ignorePunct;
-    if (which === "case") setIgnoreCase(next);
-    else setIgnorePunct(next);
-    if (current) {
-      runEval(current.gt, current.ocr, {
-        ignoreCase: which === "case" ? next : ignoreCase,
-        ignorePunct: which === "punct" ? next : ignorePunct,
-      });
-    }
+  const toggleNorm = (key) => {
+    const next = { ...norm, [key]: !norm[key] };
+    setNorm(next);
+    if (current) runEval(current.gt, current.ocr, next);
   };
 
   const handleCsv = async (file, side) => {
@@ -194,13 +192,38 @@ export default function App() {
 
         <div className="norm-opts">
           <label>
-            <input type="checkbox" checked={ignoreCase} onChange={() => onToggle("case")} />
+            <input
+              type="checkbox"
+              checked={norm.ignoreCase}
+              onChange={() => toggleNorm("ignoreCase")}
+            />
             Ignore case
           </label>
           <label>
-            <input type="checkbox" checked={ignorePunct} onChange={() => onToggle("punct")} />
+            <input
+              type="checkbox"
+              checked={norm.ignorePunct}
+              onChange={() => toggleNorm("ignorePunct")}
+            />
             Ignore punctuation
           </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={norm.ignoreSpace}
+              onChange={() => toggleNorm("ignoreSpace")}
+            />
+            Ignore space
+          </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={norm.ignoreNewline}
+              onChange={() => toggleNorm("ignoreNewline")}
+            />
+            Ignore newline
+          </label>
+          <span className="norm-note">(space &amp; newline affect CER only)</span>
         </div>
       </section>
 

@@ -36,6 +36,8 @@ class EvaluateRequest(BaseModel):
     ocr_text: str = ""
     ignore_case: bool = False
     ignore_punct: bool = False
+    ignore_space: bool = False
+    ignore_newline: bool = False
 
 
 @app.get("/")
@@ -50,4 +52,6 @@ def api_evaluate(req: EvaluateRequest):
         req.ocr_text,
         ignore_case=req.ignore_case,
         ignore_punct=req.ignore_punct,
+        ignore_space=req.ignore_space,
+        ignore_newline=req.ignore_newline,
     )

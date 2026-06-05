@@ -348,6 +348,8 @@ footer {
   margin-top: 14px;
   font-size: 13px;
   color: var(--muted);
+  flex-wrap: wrap;
+  align-items: center;
 }
 
 .norm-opts label {
@@ -355,6 +357,12 @@ footer {
   align-items: center;
   gap: 6px;
   cursor: pointer;
+}
+
+.norm-note {
+  font-size: 12px;
+  font-style: italic;
+  opacity: 0.8;
 }
 
 /* ---- Dataset / CSV ---- */
