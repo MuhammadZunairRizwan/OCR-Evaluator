@@ -253,19 +253,32 @@ def _line_sim(a: str, b: str) -> float:
     return Levenshtein.normalized_similarity(a, b)
 
 
-def _line_segs(text: str, status: str) -> List[dict]:
-    return [{"text": text, "status": status}] if text else []
+def _line_word_data(text: str, ic: bool, ip: bool):
+    """Split into lines and per-line word units; also the flat compared-word keys."""
+    lines = [x.rstrip("\r") for x in text.split("\n")]
+    line_units = [_word_units(ln, ic, ip) for ln in lines]
+    flat_keys = [k for units in line_units for _, k in units if k is not None]
+    return lines, line_units, flat_keys
 
 
-def _pair_row(lg: str, lo: str, kg: str, ko: str, ic: bool, ip: bool) -> dict:
-    """A row where both sides have a line: colour by within-line word diff."""
-    if kg == ko:
-        return {"left": _line_segs(lg, "match"), "right": _line_segs(lo, "match")}
-    res = _eval_level(_word_units(lg, ic, ip), _word_units(lo, ic, ip), WORD_ALIGN_MAX)
-    al = res["alignment"]
-    if not al:
-        return {"left": _line_segs(lg, "match"), "right": _line_segs(lo, "match")}
-    return {"left": al["left"], "right": al["right"]}
+def _color_lines(line_units: List[List[Unit]], statuses: List[str]) -> List[List[dict]]:
+    """Colour each line's words by their position in the GLOBAL word status list."""
+    out: List[List[dict]] = []
+    idx = 0
+    for units in line_units:
+        segs: List[dict] = []
+        for display, key in units:
+            if key is None:
+                status = "neutral"
+            else:
+                status = statuses[idx]
+                idx += 1
+            if segs and segs[-1]["status"] == status:
+                segs[-1]["text"] += display
+            else:
+                segs.append({"text": display, "status": status})
+        out.append(segs)
+    return out
 
 
 def align_lines(
@@ -277,19 +290,30 @@ def align_lines(
     ignore_newline: bool = False,
 ) -> dict:
     """
-    Needleman-Wunsch alignment over lines so matching blocks line up vertically.
-    Returns rows of ``{left, right}`` segment lists; a ``None`` side is a blank
-    (yellow) filler. Lines pair up fuzzily (by similarity) so OCR errors within a
-    line don't break the pairing.
+    Lay the two documents out line-by-line so matching blocks line up vertically.
+
+    * Line *structure* (which line pairs with which, where the blank yellow
+      fillers go) comes from a Needleman-Wunsch alignment over lines, matched
+      fuzzily by similarity so OCR errors don't break the pairing.
+    * Word *colouring* comes from the SAME global word alignment that produces
+      the WER, so the red/green in this view always agrees with the score.
     """
-    gl = [x.rstrip("\r") for x in ground_truth.split("\n")]
-    ol = [x.rstrip("\r") for x in ocr_text.split("\n")]
-    n, m = len(gl), len(ol)
+    g_lines, g_units, g_keys = _line_word_data(ground_truth, ignore_case, ignore_punct)
+    o_lines, o_units, o_keys = _line_word_data(ocr_text, ignore_case, ignore_punct)
+    n, m = len(g_lines), len(o_lines)
     if n * m > LINE_ALIGN_MAX_CELLS:
         return {"available": False, "reason": "too_large", "rows": []}
 
-    gk = [_line_key(x, ignore_case, ignore_punct, ignore_space) for x in gl]
-    ok = [_line_key(x, ignore_case, ignore_punct, ignore_space) for x in ol]
+    # ---- Global word colouring (identical to the WER alignment) ----
+    rs, hs = _encode(g_keys, o_keys)
+    ops = Levenshtein.editops(rs, hs)
+    g_status, o_status = _statuses(len(g_keys), len(o_keys), ops)
+    g_segs = _color_lines(g_units, g_status)
+    o_segs = _color_lines(o_units, o_status)
+
+    # ---- Line structure (Needleman-Wunsch over line similarity) ----
+    gk = [_line_key(x, ignore_case, ignore_punct, ignore_space) for x in g_lines]
+    ok = [_line_key(x, ignore_case, ignore_punct, ignore_space) for x in o_lines]
 
     dp = [[0.0] * (m + 1) for _ in range(n + 1)]
     for i in range(1, n + 1):
@@ -303,32 +327,31 @@ def align_lines(
             pair = prev[j - 1] + (2 * _line_sim(gi, ok[j - 1]) - 1)
             row[j] = max(pair, prev[j] + _LINE_GAP, row[j - 1] + _LINE_GAP)
 
-    # Backtrace
-    ops = []
+    line_ops = []
     i, j = n, m
     while i > 0 or j > 0:
         if i > 0 and j > 0:
             s = _line_sim(gk[i - 1], ok[j - 1])
             if abs(dp[i][j] - (dp[i - 1][j - 1] + (2 * s - 1))) < 1e-9:
-                ops.append(("pair", i - 1, j - 1))
+                line_ops.append(("pair", i - 1, j - 1))
                 i, j = i - 1, j - 1
                 continue
         if i > 0 and abs(dp[i][j] - (dp[i - 1][j] + _LINE_GAP)) < 1e-9:
-            ops.append(("del", i - 1, None))
+            line_ops.append(("del", i - 1, None))
             i -= 1
         else:
-            ops.append(("ins", None, j - 1))
+            line_ops.append(("ins", None, j - 1))
             j -= 1
-    ops.reverse()
+    line_ops.reverse()
 
     rows = []
-    for tag, i0, j0 in ops:
+    for tag, i0, j0 in line_ops:
         if tag == "pair":
-            rows.append(_pair_row(gl[i0], ol[j0], gk[i0], ok[j0], ignore_case, ignore_punct))
+            rows.append({"left": g_segs[i0], "right": o_segs[j0]})
         elif tag == "del":
-            rows.append({"left": _line_segs(gl[i0], "error"), "right": None})
+            rows.append({"left": g_segs[i0], "right": None})
         else:
-            rows.append({"left": None, "right": _line_segs(ol[j0], "error")})
+            rows.append({"left": None, "right": o_segs[j0]})
 
     return {"available": True, "rows": rows}
 
