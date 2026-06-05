@@ -24,6 +24,40 @@ function HighlightView({ segments }) {
   );
 }
 
+function AlignCell({ segs, side }) {
+  // segs === null  -> blank yellow filler (this line exists only on the other side)
+  // segs === []    -> a genuine blank line
+  const cls =
+    "align-cell" + (side === "left" ? " left" : "") + (segs === null ? " align-filler" : "");
+  return (
+    <div className={cls}>
+      {segs &&
+        segs.map((s, i) => (
+          <span key={i} className={SEG_CLASS[s.status] || "seg-match"}>
+            {s.text}
+          </span>
+        ))}
+    </div>
+  );
+}
+
+function AlignedView({ rows }) {
+  return (
+    <div className="aligned">
+      <div className="align-row align-head">
+        <div className="align-cell left">Ground Truth</div>
+        <div className="align-cell">OCR Result</div>
+      </div>
+      {rows.map((r, i) => (
+        <div className="align-row" key={i}>
+          <AlignCell segs={r.left} side="left" />
+          <AlignCell segs={r.right} side="right" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function Metric({ label, value, hint, good }) {
   return (
     <div className="metric">
@@ -76,6 +110,7 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [showPlain, setShowPlain] = useState(false);
+  const [alignView, setAlignView] = useState(false);
 
   // Uploaded CSV maps (null until parsed)
   const [gtUpload, setGtUpload] = useState(null); // {name, map}
@@ -92,11 +127,11 @@ export default function App() {
     return ids;
   }, [gtMap, ocrMap]);
 
-  const runEval = async (gt, ocr, opts) => {
+  const runEval = async (gt, ocr, normObj, align) => {
     setError("");
     setLoading(true);
     try {
-      const data = await evaluate(gt, ocr, opts);
+      const data = await evaluate(gt, ocr, { ...normObj, align });
       setResult(data);
     } catch (e) {
       setError(e.message || "Failed to evaluate. Is the backend awake?");
@@ -125,7 +160,7 @@ export default function App() {
 
     setCurrent({ naId, gt, ocr });
     setShowPlain(false);
-    runEval(gt, ocr, norm);
+    runEval(gt, ocr, norm, alignView);
   };
 
   const random = () => {
@@ -138,7 +173,13 @@ export default function App() {
   const toggleNorm = (key) => {
     const next = { ...norm, [key]: !norm[key] };
     setNorm(next);
-    if (current) runEval(current.gt, current.ocr, next);
+    if (current) runEval(current.gt, current.ocr, next, alignView);
+  };
+
+  const toggleAlign = () => {
+    const next = !alignView;
+    setAlignView(next);
+    if (current) runEval(current.gt, current.ocr, norm, next);
   };
 
   const handleCsv = async (file, side) => {
@@ -159,6 +200,8 @@ export default function App() {
   };
 
   const lvl = result ? (mode === "word" ? result.word : result.char) : null;
+  const aligned = result?.aligned;
+  const showAligned = alignView && aligned && aligned.available;
 
   return (
     <div className="app">
@@ -299,20 +342,39 @@ export default function App() {
 
           <div className="mode-toggle">
             <span>Highlight by:</span>
-            <button className={mode === "word" ? "active" : ""} onClick={() => setMode("word")}>
+            <button
+              className={mode === "word" ? "active" : ""}
+              onClick={() => setMode("word")}
+              disabled={showAligned}
+            >
               Word
             </button>
-            <button className={mode === "char" ? "active" : ""} onClick={() => setMode("char")}>
+            <button
+              className={mode === "char" ? "active" : ""}
+              onClick={() => setMode("char")}
+              disabled={showAligned}
+            >
               Character
             </button>
-            {lvl.truncated && (
+            <label className="align-check">
+              <input type="checkbox" checked={alignView} onChange={toggleAlign} />
+              Horizontal align
+            </label>
+            {lvl.truncated && !showAligned && (
               <button className="plain-toggle" onClick={() => setShowPlain((v) => !v)}>
                 {showPlain ? "Show highlighted preview" : "Show full plain text"}
               </button>
             )}
           </div>
 
-          {lvl.truncated && !showPlain && (
+          {alignView && aligned && !aligned.available && (
+            <div className="notice">
+              Horizontal align isn’t available for very large documents — showing the
+              standard view instead. The scores above are still exact.
+            </div>
+          )}
+
+          {lvl.truncated && !showAligned && !showPlain && (
             <div className="notice">
               Diff preview — first {fmt(lvl.preview_limit)}{" "}
               {mode === "word" ? "words" : "characters"} shown. The CER/WER and accuracy
@@ -320,24 +382,28 @@ export default function App() {
             </div>
           )}
 
-          <section className="compare">
-            <div className="compare-col">
-              <h3>Ground Truth</h3>
-              {showPlain || !lvl.alignment ? (
-                <pre className="highlight plain">{current.gt}</pre>
-              ) : (
-                <HighlightView segments={lvl.alignment.left} />
-              )}
-            </div>
-            <div className="compare-col">
-              <h3>OCR Result</h3>
-              {showPlain || !lvl.alignment ? (
-                <pre className="highlight plain">{current.ocr}</pre>
-              ) : (
-                <HighlightView segments={lvl.alignment.right} />
-              )}
-            </div>
-          </section>
+          {showAligned ? (
+            <AlignedView rows={aligned.rows} />
+          ) : (
+            <section className="compare">
+              <div className="compare-col">
+                <h3>Ground Truth</h3>
+                {showPlain || !lvl.alignment ? (
+                  <pre className="highlight plain">{current.gt}</pre>
+                ) : (
+                  <HighlightView segments={lvl.alignment.left} />
+                )}
+              </div>
+              <div className="compare-col">
+                <h3>OCR Result</h3>
+                {showPlain || !lvl.alignment ? (
+                  <pre className="highlight plain">{current.ocr}</pre>
+                ) : (
+                  <HighlightView segments={lvl.alignment.right} />
+                )}
+              </div>
+            </section>
+          )}
         </>
       )}
 

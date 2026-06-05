@@ -229,6 +229,110 @@ def _eval_level(ref_units: List[Unit], hyp_units: List[Unit], align_max: int) ->
     return result
 
 
+# --------------------------------------------------------------------------- #
+# Horizontal (line-by-line) alignment for the side-by-side view
+# --------------------------------------------------------------------------- #
+# Cap the line-alignment DP so it stays fast; above this we report unavailable.
+LINE_ALIGN_MAX_CELLS = 300_000
+_LINE_GAP = -0.4  # penalty for leaving a line unpaired (insert/delete)
+
+
+def _line_key(s: str, ic: bool, ip: bool, isp: bool) -> str:
+    if ic:
+        s = s.lower()
+    if ip:
+        s = "".join(c for c in s if c not in _PUNCT)
+    if isp:
+        s = s.replace(" ", "").replace("\t", "")
+    return s.strip()
+
+
+def _line_sim(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    return Levenshtein.normalized_similarity(a, b)
+
+
+def _line_segs(text: str, status: str) -> List[dict]:
+    return [{"text": text, "status": status}] if text else []
+
+
+def _pair_row(lg: str, lo: str, kg: str, ko: str, ic: bool, ip: bool) -> dict:
+    """A row where both sides have a line: colour by within-line word diff."""
+    if kg == ko:
+        return {"left": _line_segs(lg, "match"), "right": _line_segs(lo, "match")}
+    res = _eval_level(_word_units(lg, ic, ip), _word_units(lo, ic, ip), WORD_ALIGN_MAX)
+    al = res["alignment"]
+    if not al:
+        return {"left": _line_segs(lg, "match"), "right": _line_segs(lo, "match")}
+    return {"left": al["left"], "right": al["right"]}
+
+
+def align_lines(
+    ground_truth: str,
+    ocr_text: str,
+    ignore_case: bool = False,
+    ignore_punct: bool = False,
+    ignore_space: bool = False,
+    ignore_newline: bool = False,
+) -> dict:
+    """
+    Needleman-Wunsch alignment over lines so matching blocks line up vertically.
+    Returns rows of ``{left, right}`` segment lists; a ``None`` side is a blank
+    (yellow) filler. Lines pair up fuzzily (by similarity) so OCR errors within a
+    line don't break the pairing.
+    """
+    gl = [x.rstrip("\r") for x in ground_truth.split("\n")]
+    ol = [x.rstrip("\r") for x in ocr_text.split("\n")]
+    n, m = len(gl), len(ol)
+    if n * m > LINE_ALIGN_MAX_CELLS:
+        return {"available": False, "reason": "too_large", "rows": []}
+
+    gk = [_line_key(x, ignore_case, ignore_punct, ignore_space) for x in gl]
+    ok = [_line_key(x, ignore_case, ignore_punct, ignore_space) for x in ol]
+
+    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        dp[i][0] = dp[i - 1][0] + _LINE_GAP
+    for j in range(1, m + 1):
+        dp[0][j] = dp[0][j - 1] + _LINE_GAP
+    for i in range(1, n + 1):
+        gi = gk[i - 1]
+        row, prev = dp[i], dp[i - 1]
+        for j in range(1, m + 1):
+            pair = prev[j - 1] + (2 * _line_sim(gi, ok[j - 1]) - 1)
+            row[j] = max(pair, prev[j] + _LINE_GAP, row[j - 1] + _LINE_GAP)
+
+    # Backtrace
+    ops = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0:
+            s = _line_sim(gk[i - 1], ok[j - 1])
+            if abs(dp[i][j] - (dp[i - 1][j - 1] + (2 * s - 1))) < 1e-9:
+                ops.append(("pair", i - 1, j - 1))
+                i, j = i - 1, j - 1
+                continue
+        if i > 0 and abs(dp[i][j] - (dp[i - 1][j] + _LINE_GAP)) < 1e-9:
+            ops.append(("del", i - 1, None))
+            i -= 1
+        else:
+            ops.append(("ins", None, j - 1))
+            j -= 1
+    ops.reverse()
+
+    rows = []
+    for tag, i0, j0 in ops:
+        if tag == "pair":
+            rows.append(_pair_row(gl[i0], ol[j0], gk[i0], ok[j0], ignore_case, ignore_punct))
+        elif tag == "del":
+            rows.append({"left": _line_segs(gl[i0], "error"), "right": None})
+        else:
+            rows.append({"left": None, "right": _line_segs(ol[j0], "error")})
+
+    return {"available": True, "rows": rows}
+
+
 def evaluate(
     ground_truth: str,
     ocr_text: str,

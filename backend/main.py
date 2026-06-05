@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from metrics import evaluate
+from metrics import align_lines, evaluate
 
 app = FastAPI(title="OCR CER/WER Comparison API", version="1.0.0")
 
@@ -38,6 +38,7 @@ class EvaluateRequest(BaseModel):
     ignore_punct: bool = False
     ignore_space: bool = False
     ignore_newline: bool = False
+    align: bool = False  # also return the line-by-line horizontal alignment
 
 
 @app.get("/")
@@ -47,11 +48,13 @@ def health():
 
 @app.post("/api/evaluate")
 def api_evaluate(req: EvaluateRequest):
-    return evaluate(
-        req.ground_truth,
-        req.ocr_text,
+    norm = dict(
         ignore_case=req.ignore_case,
         ignore_punct=req.ignore_punct,
         ignore_space=req.ignore_space,
         ignore_newline=req.ignore_newline,
     )
+    result = evaluate(req.ground_truth, req.ocr_text, **norm)
+    if req.align:
+        result["aligned"] = align_lines(req.ground_truth, req.ocr_text, **norm)
+    return result
