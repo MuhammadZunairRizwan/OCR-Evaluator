@@ -49,7 +49,7 @@ function AlignedView({ rows }) {
         <div className="align-cell">OCR Result</div>
       </div>
       {rows.map((r, i) => (
-        <div className="align-row" key={i}>
+        <div className={"align-row" + (r.moved ? " moved" : "")} key={i}>
           <AlignCell segs={r.left} side="left" />
           <AlignCell segs={r.right} side="right" />
         </div>
@@ -387,7 +387,13 @@ export default function App() {
           )}
 
           {showAligned ? (
-            <AlignedView rows={aligned.rows} />
+            <>
+              <div className="align-legend">
+                <span><i className="sw filler" /> blank filler (added to align — no text removed)</span>
+                <span><i className="sw moved" /> reordered line (visual only; score unchanged)</span>
+              </div>
+              <AlignedView rows={aligned.rows} />
+            </>
           ) : (
             <section className="compare">
               <div className="compare-col">

@@ -39,6 +39,7 @@ displayed text.
 
 from __future__ import annotations
 
+import re
 import string
 from typing import List, Optional, Tuple
 
@@ -47,6 +48,7 @@ from rapidfuzz.distance import Levenshtein
 _PUNCT = set(string.punctuation)
 _SPACE = {" ", "\t"}
 _NEWLINE = {"\n", "\r"}
+_WS_RE = re.compile(r"(\s+)")  # split keeping whitespace runs
 
 # Above these sizes we skip the full alignment and show a truncated preview.
 CHAR_ALIGN_MAX = 20000   # compared characters
@@ -68,18 +70,24 @@ def _norm_word_key(w: str, ignore_case: bool, ignore_punct: bool) -> str:
 
 
 def _word_units(text: str, ignore_case: bool, ignore_punct: bool) -> List[Unit]:
-    """Words become compared units; the single space between them is neutral."""
+    """
+    Split into words (compared) and whitespace runs (neutral). The original
+    whitespace — every space, tab and newline — is preserved exactly as a
+    neutral unit, so the displayed text keeps its real formatting; only the
+    words take part in the comparison.
+    """
     units: List[Unit] = []
-    first = True
-    for w in text.split():
-        if not first:
-            units.append((" ", None))  # neutral separator (shown, not compared)
-        first = False
-        key = _norm_word_key(w, ignore_case, ignore_punct)
+    for tok in _WS_RE.split(text):
+        if not tok:
+            continue
+        if tok.strip() == "":  # a run of whitespace (spaces / tabs / newlines)
+            units.append((tok, None))
+            continue
+        key = _norm_word_key(tok, ignore_case, ignore_punct)
         if ignore_punct and key == "":
-            units.append((w, None))  # pure-punctuation word: shown, not compared
+            units.append((tok, None))  # pure-punctuation word: shown, not compared
         else:
-            units.append((w, key))
+            units.append((tok, key))
     return units
 
 
@@ -232,34 +240,49 @@ def _eval_level(ref_units: List[Unit], hyp_units: List[Unit], align_max: int) ->
 # --------------------------------------------------------------------------- #
 # Horizontal (line-by-line) alignment for the side-by-side view
 # --------------------------------------------------------------------------- #
-# Above this many words on a side, the aligned view is unavailable.
-ALIGN_MAX_WORDS = 60_000
-# A run of matching words this long becomes its own shared "anchor" row; shorter
-# matching runs are absorbed into the surrounding diff block.
-_ANCHOR_MIN = 3
+# Above this many line cells (n*m) the aligned view is unavailable.
+LINE_ALIGN_MAX_CELLS = 600_000
+_LINE_GAP = -0.4  # Needleman-Wunsch penalty for leaving a line unpaired
+# Reordering: an unmatched line may be pulled to a matching unmatched line on the
+# other side if within this many rows and at least this similar.
+REORDER_WINDOW = 4
+REORDER_MIN_SIM = 0.55
 
 
-def _words_for_align(text: str, ic: bool, ip: bool) -> List[Token]:
-    """(display, key) per word. Whitespace is dropped — the layout is re-flowed."""
-    return [(w, _norm_word_key(w, ic, ip)) for w in text.split()]
+def _line_key(s: str, ic: bool, ip: bool, isp: bool, inl: bool) -> str:
+    if ic:
+        s = s.lower()
+    if ip:
+        s = "".join(c for c in s if c not in _PUNCT)
+    if isp:
+        s = s.replace(" ", "").replace("\t", "")
+    return s.strip()
 
 
-def _row_segs(words):
-    """Merge (word, status) pairs into segments, neutral single spaces between."""
-    if not words:
-        return None  # nothing on this side -> blank (yellow) filler
-    segs: List[dict] = []
-    for idx, (w, st) in enumerate(words):
-        if idx > 0:
-            if segs and segs[-1]["status"] == "neutral":
-                segs[-1]["text"] += " "
+def _line_sim(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    return Levenshtein.normalized_similarity(a, b)
+
+
+def _color_lines(line_units, statuses):
+    """Colour each line's words by their position in the GLOBAL word status list."""
+    out = []
+    idx = 0
+    for units in line_units:
+        segs: List[dict] = []
+        for display, key in units:
+            if key is None:
+                status = "neutral"
             else:
-                segs.append({"text": " ", "status": "neutral"})
-        if segs and segs[-1]["status"] == st:
-            segs[-1]["text"] += w
-        else:
-            segs.append({"text": w, "status": st})
-    return segs
+                status = statuses[idx]
+                idx += 1
+            if segs and segs[-1]["status"] == status:
+                segs[-1]["text"] += display
+            else:
+                segs.append({"text": display, "status": status})
+        out.append(segs)
+    return out
 
 
 def _char_all(text: str, ic, ip, isp, inl, status: str):
@@ -274,27 +297,29 @@ def _char_all(text: str, ic, ip, isp, inl, status: str):
     return segs
 
 
-def _row_char(lw, rw, ic, ip, isp, inl):
-    """Character-level colouring for a row, given its left/right word lists."""
-    lt = None if lw is None else " ".join(w for w, _ in lw)
-    rt = None if rw is None else " ".join(w for w, _ in rw)
-    if lt is None:
-        return None, _char_all(rt, ic, ip, isp, inl, "error")
-    if rt is None:
-        return _char_all(lt, ic, ip, isp, inl, "error"), None
-    if lt == rt:
-        return (
-            _char_all(lt, ic, ip, isp, inl, "match"),
-            _char_all(rt, ic, ip, isp, inl, "match"),
-        )
-    lu = _char_units(lt, ic, ip, isp, inl)
-    ru = _char_units(rt, ic, ip, isp, inl)
+def _char_diff_lines(a, b, ic, ip, isp, inl):
+    """Character-level colouring of two lines against each other."""
+    if a == b:
+        return _char_all(a, ic, ip, isp, inl, "match"), _char_all(b, ic, ip, isp, inl, "match")
+    lu = _char_units(a, ic, ip, isp, inl)
+    ru = _char_units(b, ic, ip, isp, inl)
     lk = [k for _, k in lu if k is not None]
     rk = [k for _, k in ru if k is not None]
     rs, hs = _encode(lk, rk)
     ops = Levenshtein.editops(rs, hs)
     ls, rss = _statuses(len(lk), len(rk), ops)
     return _segments(lu, ls), _segments(ru, rss)
+
+
+def _word_diff_lines(a, b, ic, ip):
+    """Word-level colouring of two lines against each other (for moved rows)."""
+    res = _eval_level(_word_units(a, ic, ip), _word_units(b, ic, ip), WORD_ALIGN_MAX)
+    al = res["alignment"]
+    if al:
+        return al["left"], al["right"]
+    left = [{"text": a, "status": "match"}] if a else []
+    right = [{"text": b, "status": "match"}] if b else []
+    return left, right
 
 
 def align_lines(
@@ -307,106 +332,122 @@ def align_lines(
     level: str = "word",
 ) -> dict:
     """
-    Word-alignment-driven side-by-side layout.
+    Line-preserving side-by-side layout.
 
-    The two sides usually have different line breaks (hand transcription vs OCR
-    paragraphs), so pairing original lines leaves big gaps. Instead we align on
-    the global word diff: long runs of matching words become shared "anchor"
-    rows that keep the two columns in sync, and the changes between anchors are
-    grouped into aligned blocks. A block present on only one side gets a blank
-    (yellow) filler opposite.
+    Each side keeps its ORIGINAL lines — every space, indent and blank line is
+    shown exactly. Lines are paired by a Needleman-Wunsch alignment over line
+    similarity; a line with no partner gets a blank YELLOW filler opposite so the
+    columns stay level (we only ADD blank space, never remove text). A short
+    reorder pass can pull an unmatched ground-truth line up/down a few rows to
+    meet a matching line on the other side — those rows are marked "moved"
+    (rendered blue). Reordering is a visual aid only; the CER/WER are unchanged
+    (they remain the standard in-order scores).
 
-    The *layout* is always word-anchored; the *colouring* follows `level`:
-    "word" colours whole words (matching the WER), "char" diffs each row at the
-    character level so only the differing characters within a word are red.
+    Colouring follows `level`: "word" uses the GLOBAL word alignment (so red
+    matches the WER); "char" diffs each paired line at the character level.
     """
-    g = _words_for_align(ground_truth, ignore_case, ignore_punct)
-    o = _words_for_align(ocr_text, ignore_case, ignore_punct)
-    if max(len(g), len(o)) > ALIGN_MAX_WORDS:
+    ic, ip, isp, inl = ignore_case, ignore_punct, ignore_space, ignore_newline
+    g_lines = [x.rstrip("\r") for x in ground_truth.split("\n")]
+    o_lines = [x.rstrip("\r") for x in ocr_text.split("\n")]
+    n, m = len(g_lines), len(o_lines)
+    if n * m > LINE_ALIGN_MAX_CELLS:
         return {"available": False, "reason": "too_large", "rows": []}
 
-    rs, hs = _encode([k for _, k in g], [k for _, k in o])
+    # Per-line word units (formatting preserved) + GLOBAL word colouring.
+    g_units = [_word_units(l, ic, ip) for l in g_lines]
+    o_units = [_word_units(l, ic, ip) for l in o_lines]
+    g_keys = [k for u in g_units for _, k in u if k is not None]
+    o_keys = [k for u in o_units for _, k in u if k is not None]
+    rs, hs = _encode(g_keys, o_keys)
     ops = Levenshtein.editops(rs, hs)
+    g_status, o_status = _statuses(len(g_keys), len(o_keys), ops)
+    g_word_segs = _color_lines(g_units, g_status)
+    o_word_segs = _color_lines(o_units, o_status)
 
-    # Expand editops into a full tagged item stream (equal/sub/del/ins).
-    items = []
-    i = j = 0
-    for op in ops:
-        while i < op.src_pos:
-            items.append(("equal", g[i][0], o[j][0]))
-            i += 1
-            j += 1
-        if op.tag == "replace":
-            items.append(("sub", g[i][0], o[j][0]))
-            i += 1
-            j += 1
-        elif op.tag == "delete":
-            items.append(("del", g[i][0], None))
-            i += 1
-        else:  # insert
-            items.append(("ins", None, o[j][0]))
-            j += 1
-    while i < len(g):
-        items.append(("equal", g[i][0], o[j][0]))
-        i += 1
-        j += 1
+    # Line-structure alignment (Needleman-Wunsch over line similarity).
+    gk = [_line_key(x, ic, ip, isp, inl) for x in g_lines]
+    ok = [_line_key(x, ic, ip, isp, inl) for x in o_lines]
+    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        dp[i][0] = dp[i - 1][0] + _LINE_GAP
+    for j in range(1, m + 1):
+        dp[0][j] = dp[0][j - 1] + _LINE_GAP
+    for i in range(1, n + 1):
+        gi = gk[i - 1]
+        cur, prev = dp[i], dp[i - 1]
+        for j in range(1, m + 1):
+            pair = prev[j - 1] + (2 * _line_sim(gi, ok[j - 1]) - 1)
+            cur[j] = max(pair, prev[j] + _LINE_GAP, cur[j - 1] + _LINE_GAP)
 
-    # Group consecutive items into equal-runs vs diff-runs.
-    runs = []
-    for it in items:
-        kind = "equal" if it[0] == "equal" else "diff"
-        if runs and runs[-1][0] == kind:
-            runs[-1][1].append(it)
+    line_ops = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0:
+            s = _line_sim(gk[i - 1], ok[j - 1])
+            if abs(dp[i][j] - (dp[i - 1][j - 1] + (2 * s - 1))) < 1e-9:
+                line_ops.append(["pair", i - 1, j - 1])
+                i, j = i - 1, j - 1
+                continue
+        if i > 0 and abs(dp[i][j] - (dp[i - 1][j] + _LINE_GAP)) < 1e-9:
+            line_ops.append(["del", i - 1, None])
+            i -= 1
         else:
-            runs.append([kind, [it]])
+            line_ops.append(["ins", None, j - 1])
+            j -= 1
+    line_ops.reverse()
 
-    # Build raw rows as left/right word lists (None = blank filler side).
-    raw = []
+    # Reorder pass: pull an unmatched ground-truth line up/down to a nearby
+    # matching OCR line, rendering that row as "moved" (blue). Visual aid only.
+    used = set()
+    moved = {}  # ins op-index -> ground-truth line index pulled here
+    for p, op in enumerate(line_ops):
+        if op[0] != "ins":
+            continue
+        oj = op[2]
+        best, best_sim = None, REORDER_MIN_SIM
+        for q in range(max(0, p - REORDER_WINDOW), min(len(line_ops), p + REORDER_WINDOW + 1)):
+            cand = line_ops[q]
+            if cand[0] != "del" or q in used:
+                continue
+            sim = _line_sim(gk[cand[1]], ok[oj])
+            if sim >= best_sim:
+                best_sim, best = sim, q
+        if best is not None:
+            used.add(best)
+            moved[p] = line_ops[best][1]
 
-    def emit_diff(buf):
-        if not buf:
-            return
-        left, right = [], []
-        for tag, gw, ow in buf:
-            if tag == "equal":
-                left.append((gw, "match"))
-                right.append((ow, "match"))
-            elif tag == "sub":
-                left.append((gw, "error"))
-                right.append((ow, "error"))
-            elif tag == "del":
-                left.append((gw, "error"))
-            else:
-                right.append((ow, "error"))
-        raw.append({"left": left or None, "right": right or None})
+    def one_side(text, word_segs, is_left):
+        if text.strip() == "":
+            return [], []  # blank line is just spacing — no "missing content" filler
+        seg = _char_all(text, ic, ip, isp, inl, "error") if level == "char" else word_segs
+        return (seg, None) if is_left else (None, seg)
 
-    buf = []
-    for kind, its in runs:
-        if kind == "equal" and len(its) >= _ANCHOR_MIN:
-            emit_diff(buf)
-            buf = []
-            raw.append(
-                {
-                    "left": [(gw, "match") for _, gw, _ in its],
-                    "right": [(ow, "match") for _, _, ow in its],
-                }
-            )
-        else:
-            buf.extend(its)
-    emit_diff(buf)
-
-    # Render rows at the requested granularity.
     rows = []
-    if level == "char":
-        for r in raw:
-            left, right = _row_char(
-                r["left"], r["right"],
-                ignore_case, ignore_punct, ignore_space, ignore_newline,
-            )
+    for p, op in enumerate(line_ops):
+        tag = op[0]
+        if tag == "del" and p in used:
+            continue  # this ground-truth line was moved into a 'moved' row below
+        if tag == "pair":
+            gi, oj = op[1], op[2]
+            if level == "char":
+                left, right = _char_diff_lines(g_lines[gi], o_lines[oj], ic, ip, isp, inl)
+            else:
+                left, right = g_word_segs[gi], o_word_segs[oj]
             rows.append({"left": left, "right": right})
-    else:
-        for r in raw:
-            rows.append({"left": _row_segs(r["left"]), "right": _row_segs(r["right"])})
+        elif tag == "del":
+            left, right = one_side(g_lines[op[1]], g_word_segs[op[1]], True)
+            rows.append({"left": left, "right": right})
+        else:  # ins
+            if p in moved:
+                gi, oj = moved[p], op[2]
+                if level == "char":
+                    left, right = _char_diff_lines(g_lines[gi], o_lines[oj], ic, ip, isp, inl)
+                else:
+                    left, right = _word_diff_lines(g_lines[gi], o_lines[oj], ic, ip)
+                rows.append({"left": left, "right": right, "moved": True})
+            else:
+                left, right = one_side(o_lines[op[2]], o_word_segs[op[2]], False)
+                rows.append({"left": left, "right": right})
 
     return {"available": True, "rows": rows}
 
