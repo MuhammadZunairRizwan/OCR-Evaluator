@@ -240,32 +240,12 @@ def _eval_level(ref_units: List[Unit], hyp_units: List[Unit], align_max: int) ->
 # --------------------------------------------------------------------------- #
 # Horizontal (line-by-line) alignment for the side-by-side view
 # --------------------------------------------------------------------------- #
-# Above this many line cells (n*m) the aligned view is unavailable.
-LINE_ALIGN_MAX_CELLS = 600_000
-_LINE_GAP = -0.4  # Needleman-Wunsch penalty for leaving a line unpaired
-# Reordering: an unmatched line may be pulled to a matching unmatched line on the
-# other side if within this many rows and at least this similar.
-REORDER_WINDOW = 4
-REORDER_MIN_SIM = 0.55
-# Many-to-one line merging: up to this many short lines on one side may merge to
-# match one long line on the other (handles OCR that joins/splits lines).
-_MAX_MERGE = 3
-
-
-def _line_key(s: str, ic: bool, ip: bool, isp: bool, inl: bool) -> str:
-    if ic:
-        s = s.lower()
-    if ip:
-        s = "".join(c for c in s if c not in _PUNCT)
-    if isp:
-        s = s.replace(" ", "").replace("\t", "")
-    return s.strip()
-
-
-def _line_sim(a: str, b: str) -> float:
-    if a == b:
-        return 1.0
-    return Levenshtein.normalized_similarity(a, b)
+# Above this many words on a side, the aligned view is unavailable.
+ALIGN_MAX_WORDS = 60_000
+# A run of matching words this long becomes a shared "anchor" that keeps the
+# columns in sync; shorter matches are absorbed into the surrounding diff block.
+_ANCHOR_MIN = 3
+_WORD_RE = re.compile(r"\S+")
 
 
 def _char_all(text: str, ic, ip, isp, inl, status: str):
@@ -327,161 +307,103 @@ def align_lines(
     level: str = "word",
 ) -> dict:
     """
-    Line-preserving side-by-side layout.
+    Word-alignment-driven, formatting-preserving side-by-side layout.
 
-    Each side keeps its ORIGINAL lines — every space, indent and blank line is
-    shown exactly. Lines are paired by a Needleman-Wunsch alignment over line
-    similarity; a line with no partner gets a blank YELLOW filler opposite so the
-    columns stay level (we only ADD blank space, never remove text). A short
-    reorder pass can pull an unmatched ground-truth line up/down a few rows to
-    meet a matching line on the other side — those rows are marked "moved"
-    (rendered blue). Reordering is a visual aid only; the CER/WER are unchanged
-    (they remain the standard in-order scores).
-
-    Colouring follows `level`: "word" uses the GLOBAL word alignment (so red
-    matches the WER); "char" diffs each paired line at the character level.
+    The two sides often break lines very differently (hand transcription in short
+    lines vs OCR paragraphs), so we do NOT pair raw lines. Instead we align on the
+    global word diff: long runs of matching words become shared "anchor" blocks
+    that keep the columns in sync, and the changes between anchors form their own
+    blocks. For every block we slice the ORIGINAL text back out, so every space,
+    indent and newline is preserved exactly (we only ADD blank yellow fillers
+    where a block exists on one side only). Each block is coloured by diffing its
+    two sides, so matching content is green even where the document was reordered
+    or the OCR merged/split lines. The CER/WER are computed separately and
+    unaffected.
     """
     ic, ip, isp, inl = ignore_case, ignore_punct, ignore_space, ignore_newline
-    g_lines = [x.rstrip("\r") for x in ground_truth.split("\n")]
-    o_lines = [x.rstrip("\r") for x in ocr_text.split("\n")]
-    n, m = len(g_lines), len(o_lines)
-    if n * m > LINE_ALIGN_MAX_CELLS:
+    gspan = [mt.span() for mt in _WORD_RE.finditer(ground_truth)]
+    ospan = [mt.span() for mt in _WORD_RE.finditer(ocr_text)]
+    if max(len(gspan), len(ospan)) > ALIGN_MAX_WORDS:
         return {"available": False, "reason": "too_large", "rows": []}
 
-    # Line-structure alignment with many-to-one merging (Needleman-Wunsch).
-    gk = [_line_key(x, ic, ip, isp, inl) for x in g_lines]
-    ok = [_line_key(x, ic, ip, isp, inl) for x in o_lines]
-    glen = [len(x) for x in gk]
-    olen = [len(x) for x in ok]
-    NEG = float("-inf")
-    dp = [[NEG] * (m + 1) for _ in range(n + 1)]
-    bp = [[None] * (m + 1) for _ in range(n + 1)]
-    dp[0][0] = 0.0
-    for i in range(1, n + 1):
-        dp[i][0] = dp[i - 1][0] + _LINE_GAP
-        bp[i][0] = ("del", i - 1, 0)
-    for j in range(1, m + 1):
-        dp[0][j] = dp[0][j - 1] + _LINE_GAP
-        bp[0][j] = ("ins", 0, j - 1)
-    for i in range(1, n + 1):
-        for j in range(1, m + 1):
-            best = dp[i - 1][j] + _LINE_GAP
-            bb = ("del", i - 1, j)
-            v = dp[i][j - 1] + _LINE_GAP
-            if v > best:
-                best, bb = v, ("ins", i, j - 1)
-            v = dp[i - 1][j - 1] + (2 * _line_sim(gk[i - 1], ok[j - 1]) - 1)
-            if v > best:
-                best, bb = v, ("pair", i - 1, j - 1)
-            oj_len = olen[j - 1]
-            clen = glen[i - 1]
-            for k in range(2, _MAX_MERGE + 1):  # k GT lines -> 1 OCR line
-                if i - k < 0:
-                    break
-                clen += glen[i - k] + 1
-                if oj_len and clen > 1.6 * oj_len:
-                    break  # only grows from here
-                if oj_len and clen < 0.5 * oj_len:
-                    continue  # too short yet — try more lines
-                v = dp[i - k][j - 1] + (2 * _line_sim(" ".join(gk[i - k:i]), ok[j - 1]) - 1)
-                if v > best:
-                    best, bb = v, ("mergeG", i - k, j - 1, k)
-            gi_len = glen[i - 1]
-            clen = olen[j - 1]
-            for k in range(2, _MAX_MERGE + 1):  # 1 GT line -> k OCR lines
-                if j - k < 0:
-                    break
-                clen += olen[j - k] + 1
-                if gi_len and clen > 1.6 * gi_len:
-                    break
-                if gi_len and clen < 0.5 * gi_len:
-                    continue
-                v = dp[i - 1][j - k] + (2 * _line_sim(gk[i - 1], " ".join(ok[j - k:j])) - 1)
-                if v > best:
-                    best, bb = v, ("mergeO", i - 1, j - k, k)
-            dp[i][j] = best
-            bp[i][j] = bb
+    gkeys = [_norm_word_key(ground_truth[s:e], ic, ip) for s, e in gspan]
+    okeys = [_norm_word_key(ocr_text[s:e], ic, ip) for s, e in ospan]
+    rs, hs = _encode(gkeys, okeys)
+    ops = Levenshtein.editops(rs, hs)
 
-    line_ops = []
-    i, j = n, m
-    while i > 0 or j > 0:
-        tag = bp[i][j]
-        if tag[0] == "pair":
-            line_ops.append(["pair", tag[1], tag[2]])
-            i, j = tag[1], tag[2]
-        elif tag[0] == "del":
-            line_ops.append(["del", i - 1, None])
-            i, j = tag[1], tag[2]
-        elif tag[0] == "ins":
-            line_ops.append(["ins", None, j - 1])
-            i, j = tag[1], tag[2]
-        elif tag[0] == "mergeG":
-            pi, pj, k = tag[1], tag[2], tag[3]
-            line_ops.append(["mergeG", list(range(pi, pi + k)), pj])
-            i, j = pi, pj
-        else:  # mergeO
-            pi, pj, k = tag[1], tag[2], tag[3]
-            line_ops.append(["mergeO", pi, list(range(pj, pj + k))])
-            i, j = pi, pj
-    line_ops.reverse()
+    # Expand editops into a tagged stream of (kind, gt_word_idx, ocr_word_idx).
+    items = []
+    i = j = 0
+    for op in ops:
+        while i < op.src_pos:
+            items.append(("equal", i, j)); i += 1; j += 1
+        if op.tag == "replace":
+            items.append(("diff", i, j)); i += 1; j += 1
+        elif op.tag == "delete":
+            items.append(("diff", i, None)); i += 1
+        else:
+            items.append(("diff", None, j)); j += 1
+    while i < len(gspan):
+        items.append(("equal", i, j)); i += 1; j += 1
 
-    # Reorder pass: pull an unmatched ground-truth line up/down to a nearby
-    # matching OCR line, rendering that row as "moved" (blue). Visual aid only.
-    used = set()
-    moved = {}  # ins op-index -> ground-truth line index pulled here
-    for p, op in enumerate(line_ops):
-        if op[0] != "ins":
-            continue
-        oj = op[2]
-        best, best_sim = None, REORDER_MIN_SIM
-        for q in range(max(0, p - REORDER_WINDOW), min(len(line_ops), p + REORDER_WINDOW + 1)):
-            cand = line_ops[q]
-            if cand[0] != "del" or q in used:
-                continue
-            sim = _line_sim(gk[cand[1]], ok[oj])
-            if sim >= best_sim:
-                best_sim, best = sim, q
-        if best is not None:
-            used.add(best)
-            moved[p] = line_ops[best][1]
+    # Group consecutive equal vs diff items.
+    runs = []
+    for it in items:
+        if runs and runs[-1][0] == it[0]:
+            runs[-1][1].append(it)
+        else:
+            runs.append([it[0], [it]])
 
-    def pair_segs(gline, oline):
+    def render(lt, rt):
+        # lt / rt are the original-text slices for this block (None = filler).
+        if lt is None and rt is None:
+            return None
+        if lt is None:
+            seg = _char_all(rt, ic, ip, isp, inl, "error") if level == "char" else _word_all(rt, ic, ip, "error")
+            return {"left": None, "right": seg}
+        if rt is None:
+            seg = _char_all(lt, ic, ip, isp, inl, "error") if level == "char" else _word_all(lt, ic, ip, "error")
+            return {"left": seg, "right": None}
         if level == "char":
-            return _char_diff_lines(gline, oline, ic, ip, isp, inl)
-        return _word_diff_lines(gline, oline, ic, ip)
-
-    def one_side(text, is_left):
-        if text.strip() == "":
-            return [], []  # blank line is just spacing — no "missing content" filler
-        seg = _char_all(text, ic, ip, isp, inl, "error") if level == "char" else _word_all(text, ic, ip, "error")
-        return (seg, None) if is_left else (None, seg)
+            left, right = _char_diff_lines(lt, rt, ic, ip, isp, inl)
+        else:
+            left, right = _word_diff_lines(lt, rt, ic, ip)
+        return {"left": left, "right": right}
 
     rows = []
-    for p, op in enumerate(line_ops):
-        tag = op[0]
-        if tag == "del" and p in used:
-            continue  # this ground-truth line was moved into a 'moved' row below
-        if tag == "pair":
-            left, right = pair_segs(g_lines[op[1]], o_lines[op[2]])
-            rows.append({"left": left, "right": right})
-        elif tag == "mergeG":  # several GT lines stacked against one OCR line
-            gt_text = "\n".join(g_lines[x] for x in op[1])
-            left, right = pair_segs(gt_text, o_lines[op[2]])
-            rows.append({"left": left, "right": right})
-        elif tag == "mergeO":  # one GT line against several OCR lines
-            oc_text = "\n".join(o_lines[x] for x in op[2])
-            left, right = pair_segs(g_lines[op[1]], oc_text)
-            rows.append({"left": left, "right": right})
-        elif tag == "del":
-            left, right = one_side(g_lines[op[1]], True)
-            rows.append({"left": left, "right": right})
-        else:  # ins
-            if p in moved:
-                left, right = pair_segs(g_lines[moved[p]], o_lines[op[2]])
-                rows.append({"left": left, "right": right, "moved": True})
-            else:
-                left, right = one_side(o_lines[op[2]], False)
-                rows.append({"left": left, "right": right})
+    prev_g = prev_o = 0  # char offsets consumed so far (keeps all whitespace)
+    buf_g, buf_o = [], []
+
+    def flush_diff():
+        nonlocal prev_g, prev_o, buf_g, buf_o
+        if not buf_g and not buf_o:
+            return
+        lt = rt = None
+        if buf_g:
+            end = gspan[buf_g[-1]][1]; lt = ground_truth[prev_g:end]; prev_g = end
+        if buf_o:
+            end = ospan[buf_o[-1]][1]; rt = ocr_text[prev_o:end]; prev_o = end
+        r = render(lt, rt)
+        if r:
+            rows.append(r)
+        buf_g, buf_o = [], []
+
+    for kind, its in runs:
+        if kind == "equal" and len(its) >= _ANCHOR_MIN:
+            flush_diff()
+            ge, oe = gspan[its[-1][1]][1], ospan[its[-1][2]][1]
+            lt = ground_truth[prev_g:ge]; prev_g = ge
+            rt = ocr_text[prev_o:oe]; prev_o = oe
+            r = render(lt, rt)
+            if r:
+                rows.append(r)
+        else:
+            for it in its:
+                if it[1] is not None:
+                    buf_g.append(it[1])
+                if it[2] is not None:
+                    buf_o.append(it[2])
+    flush_diff()
 
     return {"available": True, "rows": rows}
 

@@ -389,8 +389,8 @@ export default function App() {
           {showAligned ? (
             <>
               <div className="align-legend">
-                <span><i className="sw filler" /> blank filler (added to align — no text removed)</span>
-                <span><i className="sw moved" /> reordered line (visual only; score unchanged)</span>
+                <span><i className="sw filler" /> blank filler (added to align — original text never removed)</span>
+                <span>matching content stays green even when reordered or re-wrapped</span>
               </div>
               <AlignedView rows={aligned.rows} />
             </>
