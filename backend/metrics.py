@@ -265,30 +265,22 @@ def _line_sim(a: str, b: str) -> float:
     return Levenshtein.normalized_similarity(a, b)
 
 
-def _color_lines(line_units, statuses):
-    """Colour each line's words by their position in the GLOBAL word status list."""
-    out = []
-    idx = 0
-    for units in line_units:
-        segs: List[dict] = []
-        for display, key in units:
-            if key is None:
-                status = "neutral"
-            else:
-                status = statuses[idx]
-                idx += 1
-            if segs and segs[-1]["status"] == status:
-                segs[-1]["text"] += display
-            else:
-                segs.append({"text": display, "status": status})
-        out.append(segs)
-    return out
-
-
 def _char_all(text: str, ic, ip, isp, inl, status: str):
     """Char segments for one side of a filler/identical row (ignored chars neutral)."""
     segs: List[dict] = []
     for disp, key in _char_units(text, ic, ip, isp, inl):
+        st = "neutral" if key is None else status
+        if segs and segs[-1]["status"] == st:
+            segs[-1]["text"] += disp
+        else:
+            segs.append({"text": disp, "status": st})
+    return segs
+
+
+def _word_all(text: str, ic, ip, status: str):
+    """Word segments for one line at a single status (whitespace neutral)."""
+    segs: List[dict] = []
+    for disp, key in _word_units(text, ic, ip):
         st = "neutral" if key is None else status
         if segs and segs[-1]["status"] == st:
             segs[-1]["text"] += disp
@@ -353,17 +345,6 @@ def align_lines(
     if n * m > LINE_ALIGN_MAX_CELLS:
         return {"available": False, "reason": "too_large", "rows": []}
 
-    # Per-line word units (formatting preserved) + GLOBAL word colouring.
-    g_units = [_word_units(l, ic, ip) for l in g_lines]
-    o_units = [_word_units(l, ic, ip) for l in o_lines]
-    g_keys = [k for u in g_units for _, k in u if k is not None]
-    o_keys = [k for u in o_units for _, k in u if k is not None]
-    rs, hs = _encode(g_keys, o_keys)
-    ops = Levenshtein.editops(rs, hs)
-    g_status, o_status = _statuses(len(g_keys), len(o_keys), ops)
-    g_word_segs = _color_lines(g_units, g_status)
-    o_word_segs = _color_lines(o_units, o_status)
-
     # Line-structure alignment (Needleman-Wunsch over line similarity).
     gk = [_line_key(x, ic, ip, isp, inl) for x in g_lines]
     ok = [_line_key(x, ic, ip, isp, inl) for x in o_lines]
@@ -416,10 +397,15 @@ def align_lines(
             used.add(best)
             moved[p] = line_ops[best][1]
 
-    def one_side(text, word_segs, is_left):
+    def pair_segs(gline, oline):
+        if level == "char":
+            return _char_diff_lines(gline, oline, ic, ip, isp, inl)
+        return _word_diff_lines(gline, oline, ic, ip)
+
+    def one_side(text, is_left):
         if text.strip() == "":
             return [], []  # blank line is just spacing — no "missing content" filler
-        seg = _char_all(text, ic, ip, isp, inl, "error") if level == "char" else word_segs
+        seg = _char_all(text, ic, ip, isp, inl, "error") if level == "char" else _word_all(text, ic, ip, "error")
         return (seg, None) if is_left else (None, seg)
 
     rows = []
@@ -428,25 +414,17 @@ def align_lines(
         if tag == "del" and p in used:
             continue  # this ground-truth line was moved into a 'moved' row below
         if tag == "pair":
-            gi, oj = op[1], op[2]
-            if level == "char":
-                left, right = _char_diff_lines(g_lines[gi], o_lines[oj], ic, ip, isp, inl)
-            else:
-                left, right = g_word_segs[gi], o_word_segs[oj]
+            left, right = pair_segs(g_lines[op[1]], o_lines[op[2]])
             rows.append({"left": left, "right": right})
         elif tag == "del":
-            left, right = one_side(g_lines[op[1]], g_word_segs[op[1]], True)
+            left, right = one_side(g_lines[op[1]], True)
             rows.append({"left": left, "right": right})
         else:  # ins
             if p in moved:
-                gi, oj = moved[p], op[2]
-                if level == "char":
-                    left, right = _char_diff_lines(g_lines[gi], o_lines[oj], ic, ip, isp, inl)
-                else:
-                    left, right = _word_diff_lines(g_lines[gi], o_lines[oj], ic, ip)
+                left, right = pair_segs(g_lines[moved[p]], o_lines[op[2]])
                 rows.append({"left": left, "right": right, "moved": True})
             else:
-                left, right = one_side(o_lines[op[2]], o_word_segs[op[2]], False)
+                left, right = one_side(o_lines[op[2]], False)
                 rows.append({"left": left, "right": right})
 
     return {"available": True, "rows": rows}
