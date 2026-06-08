@@ -247,6 +247,9 @@ _LINE_GAP = -0.4  # Needleman-Wunsch penalty for leaving a line unpaired
 # other side if within this many rows and at least this similar.
 REORDER_WINDOW = 4
 REORDER_MIN_SIM = 0.55
+# Many-to-one line merging: up to this many short lines on one side may merge to
+# match one long line on the other (handles OCR that joins/splits lines).
+_MAX_MERGE = 3
 
 
 def _line_key(s: str, ic: bool, ip: bool, isp: bool, inl: bool) -> str:
@@ -345,36 +348,81 @@ def align_lines(
     if n * m > LINE_ALIGN_MAX_CELLS:
         return {"available": False, "reason": "too_large", "rows": []}
 
-    # Line-structure alignment (Needleman-Wunsch over line similarity).
+    # Line-structure alignment with many-to-one merging (Needleman-Wunsch).
     gk = [_line_key(x, ic, ip, isp, inl) for x in g_lines]
     ok = [_line_key(x, ic, ip, isp, inl) for x in o_lines]
-    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+    glen = [len(x) for x in gk]
+    olen = [len(x) for x in ok]
+    NEG = float("-inf")
+    dp = [[NEG] * (m + 1) for _ in range(n + 1)]
+    bp = [[None] * (m + 1) for _ in range(n + 1)]
+    dp[0][0] = 0.0
     for i in range(1, n + 1):
         dp[i][0] = dp[i - 1][0] + _LINE_GAP
+        bp[i][0] = ("del", i - 1, 0)
     for j in range(1, m + 1):
         dp[0][j] = dp[0][j - 1] + _LINE_GAP
+        bp[0][j] = ("ins", 0, j - 1)
     for i in range(1, n + 1):
-        gi = gk[i - 1]
-        cur, prev = dp[i], dp[i - 1]
         for j in range(1, m + 1):
-            pair = prev[j - 1] + (2 * _line_sim(gi, ok[j - 1]) - 1)
-            cur[j] = max(pair, prev[j] + _LINE_GAP, cur[j - 1] + _LINE_GAP)
+            best = dp[i - 1][j] + _LINE_GAP
+            bb = ("del", i - 1, j)
+            v = dp[i][j - 1] + _LINE_GAP
+            if v > best:
+                best, bb = v, ("ins", i, j - 1)
+            v = dp[i - 1][j - 1] + (2 * _line_sim(gk[i - 1], ok[j - 1]) - 1)
+            if v > best:
+                best, bb = v, ("pair", i - 1, j - 1)
+            oj_len = olen[j - 1]
+            clen = glen[i - 1]
+            for k in range(2, _MAX_MERGE + 1):  # k GT lines -> 1 OCR line
+                if i - k < 0:
+                    break
+                clen += glen[i - k] + 1
+                if oj_len and clen > 1.6 * oj_len:
+                    break  # only grows from here
+                if oj_len and clen < 0.5 * oj_len:
+                    continue  # too short yet — try more lines
+                v = dp[i - k][j - 1] + (2 * _line_sim(" ".join(gk[i - k:i]), ok[j - 1]) - 1)
+                if v > best:
+                    best, bb = v, ("mergeG", i - k, j - 1, k)
+            gi_len = glen[i - 1]
+            clen = olen[j - 1]
+            for k in range(2, _MAX_MERGE + 1):  # 1 GT line -> k OCR lines
+                if j - k < 0:
+                    break
+                clen += olen[j - k] + 1
+                if gi_len and clen > 1.6 * gi_len:
+                    break
+                if gi_len and clen < 0.5 * gi_len:
+                    continue
+                v = dp[i - 1][j - k] + (2 * _line_sim(gk[i - 1], " ".join(ok[j - k:j])) - 1)
+                if v > best:
+                    best, bb = v, ("mergeO", i - 1, j - k, k)
+            dp[i][j] = best
+            bp[i][j] = bb
 
     line_ops = []
     i, j = n, m
     while i > 0 or j > 0:
-        if i > 0 and j > 0:
-            s = _line_sim(gk[i - 1], ok[j - 1])
-            if abs(dp[i][j] - (dp[i - 1][j - 1] + (2 * s - 1))) < 1e-9:
-                line_ops.append(["pair", i - 1, j - 1])
-                i, j = i - 1, j - 1
-                continue
-        if i > 0 and abs(dp[i][j] - (dp[i - 1][j] + _LINE_GAP)) < 1e-9:
+        tag = bp[i][j]
+        if tag[0] == "pair":
+            line_ops.append(["pair", tag[1], tag[2]])
+            i, j = tag[1], tag[2]
+        elif tag[0] == "del":
             line_ops.append(["del", i - 1, None])
-            i -= 1
-        else:
+            i, j = tag[1], tag[2]
+        elif tag[0] == "ins":
             line_ops.append(["ins", None, j - 1])
-            j -= 1
+            i, j = tag[1], tag[2]
+        elif tag[0] == "mergeG":
+            pi, pj, k = tag[1], tag[2], tag[3]
+            line_ops.append(["mergeG", list(range(pi, pi + k)), pj])
+            i, j = pi, pj
+        else:  # mergeO
+            pi, pj, k = tag[1], tag[2], tag[3]
+            line_ops.append(["mergeO", pi, list(range(pj, pj + k))])
+            i, j = pi, pj
     line_ops.reverse()
 
     # Reorder pass: pull an unmatched ground-truth line up/down to a nearby
@@ -415,6 +463,14 @@ def align_lines(
             continue  # this ground-truth line was moved into a 'moved' row below
         if tag == "pair":
             left, right = pair_segs(g_lines[op[1]], o_lines[op[2]])
+            rows.append({"left": left, "right": right})
+        elif tag == "mergeG":  # several GT lines stacked against one OCR line
+            gt_text = "\n".join(g_lines[x] for x in op[1])
+            left, right = pair_segs(gt_text, o_lines[op[2]])
+            rows.append({"left": left, "right": right})
+        elif tag == "mergeO":  # one GT line against several OCR lines
+            oc_text = "\n".join(o_lines[x] for x in op[2])
+            left, right = pair_segs(g_lines[op[1]], oc_text)
             rows.append({"left": left, "right": right})
         elif tag == "del":
             left, right = one_side(g_lines[op[1]], True)
