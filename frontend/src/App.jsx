@@ -390,7 +390,7 @@ export default function App() {
             <>
               <div className="align-legend">
                 <span><i className="sw filler" /> blank filler (added to align — original text never removed)</span>
-                <span>matching content stays green even when reordered or re-wrapped</span>
+                <span><i className="sw moved" /> reordered block, pulled into place (visual only; score unchanged)</span>
               </div>
               <AlignedView rows={aligned.rows} />
             </>

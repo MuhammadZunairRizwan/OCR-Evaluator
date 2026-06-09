@@ -246,6 +246,26 @@ ALIGN_MAX_WORDS = 60_000
 # columns in sync; shorter matches are absorbed into the surrounding diff block.
 _ANCHOR_MIN = 3
 _WORD_RE = re.compile(r"\S+")
+# Block-level reordering: a one-sided ground-truth block may pair with a similar
+# one-sided OCR block within this many blocks (rendered blue). Visual aid only.
+REORDER_BLOCK_WINDOW = 12
+REORDER_BLOCK_SIM = 0.45
+
+
+def _line_key(s: str, ic: bool, ip: bool, isp: bool, inl: bool) -> str:
+    if ic:
+        s = s.lower()
+    if ip:
+        s = "".join(c for c in s if c not in _PUNCT)
+    if isp:
+        s = s.replace(" ", "").replace("\t", "")
+    return " ".join(s.split())
+
+
+def _line_sim(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    return Levenshtein.normalized_similarity(a, b)
 
 
 def _char_all(text: str, ic, ip, isp, inl, status: str):
@@ -346,14 +366,6 @@ def align_lines(
     while i < len(gspan):
         items.append(("equal", i, j)); i += 1; j += 1
 
-    # Group consecutive equal vs diff items.
-    runs = []
-    for it in items:
-        if runs and runs[-1][0] == it[0]:
-            runs[-1][1].append(it)
-        else:
-            runs.append([it[0], [it]])
-
     def render(lt, rt):
         # lt / rt are the original-text slices for this block (None = filler).
         if lt is None and rt is None:
@@ -370,40 +382,115 @@ def align_lines(
             left, right = _word_diff_lines(lt, rt, ic, ip)
         return {"left": left, "right": right}
 
-    rows = []
-    prev_g = prev_o = 0  # char offsets consumed so far (keeps all whitespace)
-    buf_g, buf_o = [], []
+    # Build blocks by type so deletions and insertions are SEPARATE one-sided
+    # blocks (this lets the reorder pass pair a moved GT block with its OCR copy).
+    #   paired = equal or substitution (both sides, rendered side-by-side)
+    #   del    = ground-truth-only run    ins = OCR-only run
+    def itype(it):
+        if it[0] == "equal" or (it[1] is not None and it[2] is not None):
+            return "paired"
+        return "del" if it[1] is not None else "ins"
 
-    def flush_diff():
-        nonlocal prev_g, prev_o, buf_g, buf_o
-        if not buf_g and not buf_o:
-            return
-        lt = rt = None
-        if buf_g:
-            end = gspan[buf_g[-1]][1]; lt = ground_truth[prev_g:end]; prev_g = end
-        if buf_o:
-            end = ospan[buf_o[-1]][1]; rt = ocr_text[prev_o:end]; prev_o = end
+    blocks = []
+    cur_t, cur_g, cur_o = None, [], []
+    for it in items:
+        t = itype(it)
+        if t != cur_t:
+            if cur_g or cur_o:
+                blocks.append({"g": cur_g, "o": cur_o, "type": cur_t})
+            cur_t, cur_g, cur_o = t, [], []
+        if it[1] is not None:
+            cur_g.append(it[1])
+        if it[2] is not None:
+            cur_o.append(it[2])
+    if cur_g or cur_o:
+        blocks.append({"g": cur_g, "o": cur_o, "type": cur_t})
+
+    # Absorb tiny one-sided blocks (1-2 stray tokens, e.g. OCR markup "##", "}")
+    # into the previous block so they render inline instead of as a filler row.
+    _ONESIDE_MIN = 3
+    merged = []
+    for b in blocks:
+        if (merged and b["type"] in ("del", "ins")
+                and len(b["g"]) + len(b["o"]) < _ONESIDE_MIN):
+            merged[-1]["g"] += b["g"]
+            merged[-1]["o"] += b["o"]
+            merged[-1]["type"] = "paired"
+        else:
+            merged.append({"g": list(b["g"]), "o": list(b["o"]), "type": b["type"]})
+    blocks = merged
+
+    # Slice the ORIGINAL text for a block — leading whitespace (back to the prior
+    # word) is included so every space/newline lands in exactly one block, and
+    # the slice depends only on the block's own words (so reordering is safe).
+    def g_slice(idxs):
+        a, b = idxs[0], idxs[-1]
+        return ground_truth[(gspan[a - 1][1] if a > 0 else 0):gspan[b][1]]
+
+    def o_slice(idxs):
+        a, b = idxs[0], idxs[-1]
+        return ocr_text[(ospan[a - 1][1] if a > 0 else 0):ospan[b][1]]
+
+    # Block-level reorder: pair a moved OCR-only block with a nearby GT-only
+    # block of similar text, shown as one "moved" (blue) row. Score unaffected.
+    skip, moved_to, used_del = set(), {}, set()
+    for s, b in enumerate(blocks):
+        if b["type"] != "ins":
+            continue
+        okey = _line_key(o_slice(b["o"]), ic, ip, isp, inl)
+        if not okey:
+            continue
+        best, best_sim = None, REORDER_BLOCK_SIM
+        for d in range(max(0, s - REORDER_BLOCK_WINDOW), min(len(blocks), s + REORDER_BLOCK_WINDOW + 1)):
+            db = blocks[d]
+            if db["type"] != "del" or d in used_del:
+                continue
+            sim = _line_sim(_line_key(g_slice(db["g"]), ic, ip, isp, inl), okey)
+            if sim >= best_sim:
+                best_sim, best = sim, d
+        if best is not None:
+            used_del.add(best)
+            skip.add(best)
+            moved_to[s] = best
+
+    rows = []
+    k, N = 0, len(blocks)
+    while k < N:
+        if k in skip:
+            k += 1
+            continue  # ground-truth block was pulled to a 'moved' row elsewhere
+        b = blocks[k]
+        if k in moved_to:
+            d = blocks[moved_to[k]]
+            r = render(g_slice(d["g"]), o_slice(b["o"]))
+            if r:
+                r["moved"] = True
+                rows.append(r)
+            k += 1
+            continue
+        # A local deletion immediately next to an insertion is a substitution —
+        # render the pair side-by-side instead of as two stacked filler rows.
+        nxt = k + 1
+        if nxt < N and nxt not in skip and nxt not in moved_to:
+            b2 = blocks[nxt]
+            if b["type"] == "del" and b2["type"] == "ins":
+                r = render(g_slice(b["g"]), o_slice(b2["o"]))
+                if r:
+                    rows.append(r)
+                k += 2
+                continue
+            if b["type"] == "ins" and b2["type"] == "del":
+                r = render(g_slice(b2["g"]), o_slice(b["o"]))
+                if r:
+                    rows.append(r)
+                k += 2
+                continue
+        lt = g_slice(b["g"]) if b["g"] else None
+        rt = o_slice(b["o"]) if b["o"] else None
         r = render(lt, rt)
         if r:
             rows.append(r)
-        buf_g, buf_o = [], []
-
-    for kind, its in runs:
-        if kind == "equal" and len(its) >= _ANCHOR_MIN:
-            flush_diff()
-            ge, oe = gspan[its[-1][1]][1], ospan[its[-1][2]][1]
-            lt = ground_truth[prev_g:ge]; prev_g = ge
-            rt = ocr_text[prev_o:oe]; prev_o = oe
-            r = render(lt, rt)
-            if r:
-                rows.append(r)
-        else:
-            for it in its:
-                if it[1] is not None:
-                    buf_g.append(it[1])
-                if it[2] is not None:
-                    buf_o.append(it[2])
-    flush_diff()
+        k += 1
 
     return {"available": True, "rows": rows}
 
