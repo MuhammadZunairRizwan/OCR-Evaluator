@@ -312,6 +312,9 @@ _WORD_RE = re.compile(r"\S+")
 # one-sided OCR block within this many blocks (rendered blue). Visual aid only.
 REORDER_BLOCK_WINDOW = 12
 REORDER_BLOCK_SIM = 0.45
+# Above this many characters on a side, skip the global char colouring (fall back
+# to per-block char diff) to keep the aligned char view fast.
+_CHAR_GLOBAL_MAX = 120_000
 
 
 def _line_key(s: str, ic: bool, ip: bool, isp: bool, inl: bool) -> str:
@@ -428,22 +431,6 @@ def align_lines(
     while i < len(gspan):
         items.append(("equal", i, j)); i += 1; j += 1
 
-    def render(lt, rt):
-        # lt / rt are the original-text slices for this block (None = filler).
-        if lt is None and rt is None:
-            return None
-        if lt is None:
-            seg = _char_all(rt, ic, ip, isp, inl, "error") if level == "char" else _word_all(rt, ic, ip, "error")
-            return {"left": None, "right": seg}
-        if rt is None:
-            seg = _char_all(lt, ic, ip, isp, inl, "error") if level == "char" else _word_all(lt, ic, ip, "error")
-            return {"left": seg, "right": None}
-        if level == "char":
-            left, right = _char_diff_lines(lt, rt, ic, ip, isp, inl)
-        else:
-            left, right = _word_diff_lines(lt, rt, ic, ip)
-        return {"left": left, "right": right}
-
     # Build blocks by type so deletions and insertions are SEPARATE one-sided
     # blocks (this lets the reorder pass pair a moved GT block with its OCR copy).
     #   paired = equal or substitution (both sides, rendered side-by-side)
@@ -493,6 +480,79 @@ def align_lines(
         a, b = idxs[0], idxs[-1]
         return ocr_text[(ospan[a - 1][1] if a > 0 else 0):ospan[b][1]]
 
+    def g_off(idxs):
+        a, b = idxs[0], idxs[-1]
+        return (gspan[a - 1][1] if a > 0 else 0), gspan[b][1]
+
+    def o_off(idxs):
+        a, b = idxs[0], idxs[-1]
+        return (ospan[a - 1][1] if a > 0 else 0), ospan[b][1]
+
+    # GLOBAL per-character status (char level only). The block layout comes from
+    # the WORD alignment, but a per-block char diff mis-colours content that the
+    # two sides split across a block boundary (e.g. OCR hyphenates "doc-\n umentary",
+    # or groups "30" with a different neighbour). A single global char alignment
+    # colours those matches correctly across blocks. Reordered/moved blocks still
+    # use a local char diff so their content stays green.
+    g_cstat = o_cstat = None
+    if level == "char" and max(len(ground_truth), len(ocr_text)) <= _CHAR_GLOBAL_MAX:
+        gcu = _char_units(ground_truth, ic, ip, isp, inl)
+        ocu = _char_units(ocr_text, ic, ip, isp, inl)
+        gck = [k for _, k in gcu if k is not None]
+        ock = [k for _, k in ocu if k is not None]
+        gcs, ocs = _statuses(len(gck), len(ock), Levenshtein.editops(*_encode(gck, ock)))
+
+        def _expand(units, comp):
+            out, ci = [], 0
+            for _, k in units:
+                if k is None:
+                    out.append("neutral")
+                else:
+                    out.append(comp[ci])
+                    ci += 1
+            return out
+
+        g_cstat = _expand(gcu, gcs)
+        o_cstat = _expand(ocu, ocs)
+
+    def _char_status_segs(text, status, start, end):
+        segs = []
+        for p in range(start, end):
+            st = status[p]
+            if segs and segs[-1]["status"] == st:
+                segs[-1]["text"] += text[p]
+            else:
+                segs.append({"text": text[p], "status": st})
+        return segs
+
+    def render_block(gi, oi, moved=False):
+        lt = g_slice(gi) if gi else None
+        rt = o_slice(oi) if oi else None
+        if lt is None and rt is None:
+            return None
+        if lt is None:
+            seg = _char_all(rt, ic, ip, isp, inl, "error") if level == "char" else _word_all(rt, ic, ip, "error")
+            d = {"left": None, "right": seg}
+        elif rt is None:
+            seg = _char_all(lt, ic, ip, isp, inl, "error") if level == "char" else _word_all(lt, ic, ip, "error")
+            d = {"left": seg, "right": None}
+        elif level == "char" and not moved and g_cstat is not None:
+            gs, ge = g_off(gi)
+            os_, oe = o_off(oi)
+            d = {
+                "left": _char_status_segs(ground_truth, g_cstat, gs, ge),
+                "right": _char_status_segs(ocr_text, o_cstat, os_, oe),
+            }
+        elif level == "char":
+            left, right = _char_diff_lines(lt, rt, ic, ip, isp, inl)
+            d = {"left": left, "right": right}
+        else:
+            left, right = _word_diff_lines(lt, rt, ic, ip)
+            d = {"left": left, "right": right}
+        if moved:
+            d["moved"] = True
+        return d
+
     # Block-level reorder: pair a moved OCR-only block with a nearby GT-only
     # block of similar text, shown as one "moved" (blue) row. Score unaffected.
     skip, moved_to, used_del = set(), {}, set()
@@ -524,9 +584,8 @@ def align_lines(
         b = blocks[k]
         if k in moved_to:
             d = blocks[moved_to[k]]
-            r = render(g_slice(d["g"]), o_slice(b["o"]))
+            r = render_block(d["g"], b["o"], moved=True)
             if r:
-                r["moved"] = True
                 rows.append(r)
             k += 1
             continue
@@ -536,20 +595,18 @@ def align_lines(
         if nxt < N and nxt not in skip and nxt not in moved_to:
             b2 = blocks[nxt]
             if b["type"] == "del" and b2["type"] == "ins":
-                r = render(g_slice(b["g"]), o_slice(b2["o"]))
+                r = render_block(b["g"], b2["o"])
                 if r:
                     rows.append(r)
                 k += 2
                 continue
             if b["type"] == "ins" and b2["type"] == "del":
-                r = render(g_slice(b2["g"]), o_slice(b["o"]))
+                r = render_block(b2["g"], b["o"])
                 if r:
                     rows.append(r)
                 k += 2
                 continue
-        lt = g_slice(b["g"]) if b["g"] else None
-        rt = o_slice(b["o"]) if b["o"] else None
-        r = render(lt, rt)
+        r = render_block(b["g"], b["o"])
         if r:
             rows.append(r)
         k += 1
