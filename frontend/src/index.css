@@ -292,6 +292,19 @@ button.primary:hover {
   color: var(--text);
 }
 
+/* Reordered ("moved") content: present on both sides but out of order. Not
+   counted as an error. */
+.seg-moved {
+  background: #dbeafe;
+  color: #1e40af;
+  font-weight: 600;
+}
+
+.moved-tag {
+  color: #1e40af;
+  font-weight: 600;
+}
+
 footer {
   margin-top: 40px;
   text-align: center;

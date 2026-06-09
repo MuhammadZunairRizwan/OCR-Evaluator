@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import re
 import string
+from collections import defaultdict
 from typing import List, Optional, Tuple
 
 from rapidfuzz.distance import Levenshtein
@@ -140,6 +141,50 @@ def _statuses(n_ref: int, n_hyp: int, ops) -> Tuple[List[str], List[str]]:
     return ref, hyp
 
 
+def _statuses_reorder(n_ref, n_hyp, ops, ref_keys, hyp_keys):
+    """
+    Like `_statuses`, but reorder-aware: a deleted reference token whose key also
+    appears among the inserted tokens is treated as MOVED (the content is present,
+    just out of order) rather than an error. Moved tokens are not penalised in the
+    error count. Returns (ref_status, hyp_status, counts).
+    """
+    ref = ["match"] * n_ref
+    hyp = ["match"] * n_hyp
+    del_pos = []
+    ins_by_key = defaultdict(list)
+    sub = 0
+    for op in ops:
+        if op.tag == "replace":
+            ref[op.src_pos] = "error"
+            hyp[op.dest_pos] = "error"
+            sub += 1
+        elif op.tag == "delete":
+            ref[op.src_pos] = "error"
+            del_pos.append(op.src_pos)
+        elif op.tag == "insert":
+            hyp[op.dest_pos] = "error"
+            ins_by_key[hyp_keys[op.dest_pos]].append(op.dest_pos)
+
+    moved = 0
+    for sp in del_pos:
+        lst = ins_by_key.get(ref_keys[sp])
+        if lst:
+            ref[sp] = "moved"
+            hyp[lst.pop()] = "moved"
+            moved += 1
+
+    del_remaining = len(del_pos) - moved
+    ins_remaining = sum(len(v) for v in ins_by_key.values())
+    counts = {
+        "substitutions": sub,
+        "deletions": del_remaining,
+        "insertions": ins_remaining,
+        "hits": n_ref - sub - len(del_pos),
+        "moved": moved,
+    }
+    return ref, hyp, counts
+
+
 def _segments(units: List[Unit], statuses: List[str]) -> List[dict]:
     """
     Walk display units, colouring compared ones by their status and rendering
@@ -176,23 +221,16 @@ def _prefix_units(units: List[Unit], max_compared: int) -> List[Unit]:
 # --------------------------------------------------------------------------- #
 # Per-level evaluation
 # --------------------------------------------------------------------------- #
-def _eval_level(ref_units: List[Unit], hyp_units: List[Unit], align_max: int) -> dict:
+def _eval_level(ref_units, hyp_units, align_max, reorder=False) -> dict:
     ref_keys = [k for _, k in ref_units if k is not None]
     hyp_keys = [k for _, k in hyp_units if k is not None]
     rs, hs = _encode(ref_keys, hyp_keys)
-
-    distance = Levenshtein.distance(rs, hs)
     n = len(ref_keys)
-    if n == 0:
-        rate = 0.0 if distance == 0 else 1.0
-    else:
-        rate = distance / n
-    accuracy = max(0.0, 1.0 - rate)
 
     result = {
-        "error_rate": rate,
-        "accuracy": accuracy,
-        "distance": distance,
+        "error_rate": 0.0,
+        "accuracy": 1.0,
+        "distance": 0,
         "ref_length": n,
         "hyp_length": len(hyp_keys),
         "included": False,
@@ -204,35 +242,59 @@ def _eval_level(ref_units: List[Unit], hyp_units: List[Unit], align_max: int) ->
 
     if max(len(rs), len(hs)) <= align_max:
         ops = Levenshtein.editops(rs, hs)
-        sub = sum(1 for op in ops if op.tag == "replace")
-        dele = sum(1 for op in ops if op.tag == "delete")
-        ins = sum(1 for op in ops if op.tag == "insert")
-        ref_status, hyp_status = _statuses(n, len(hyp_keys), ops)
-        result["included"] = True
-        result["counts"] = {
-            "substitutions": sub,
-            "deletions": dele,
-            "insertions": ins,
-            "hits": n - sub - dele,
-        }
-        result["alignment"] = {
-            "left": _segments(ref_units, ref_status),
-            "right": _segments(hyp_units, hyp_status),
-        }
+        if reorder:
+            ref_status, hyp_status, counts = _statuses_reorder(
+                n, len(hyp_keys), ops, ref_keys, hyp_keys
+            )
+        else:
+            ref_status, hyp_status = _statuses(n, len(hyp_keys), ops)
+            sub = sum(1 for op in ops if op.tag == "replace")
+            dele = sum(1 for op in ops if op.tag == "delete")
+            ins = sum(1 for op in ops if op.tag == "insert")
+            counts = {
+                "substitutions": sub,
+                "deletions": dele,
+                "insertions": ins,
+                "hits": n - sub - dele,
+                "moved": 0,
+            }
+        errors = counts["substitutions"] + counts["deletions"] + counts["insertions"]
+        if n == 0:
+            rate = 0.0 if errors == 0 else 1.0
+        else:
+            rate = errors / n
+        result.update(
+            error_rate=rate,
+            accuracy=max(0.0, 1.0 - rate),
+            distance=errors,
+            included=True,
+            counts=counts,
+            alignment={
+                "left": _segments(ref_units, ref_status),
+                "right": _segments(hyp_units, hyp_status),
+            },
+        )
     else:
-        # Too large for a full alignment: exact scores stand, show a preview.
+        # Too large for a full alignment: standard distance, show a preview.
+        distance = Levenshtein.distance(rs, hs)
+        rate = 0.0 if n == 0 and distance == 0 else (1.0 if n == 0 else distance / n)
         ru = _prefix_units(ref_units, align_max)
         hu = _prefix_units(hyp_units, align_max)
         n_ref_p = sum(1 for _, k in ru if k is not None)
         n_hyp_p = sum(1 for _, k in hu if k is not None)
         ops = Levenshtein.editops(rs[:align_max], hs[:align_max])
         ref_status, hyp_status = _statuses(n_ref_p, n_hyp_p, ops)
-        result["truncated"] = True
-        result["preview_limit"] = align_max
-        result["alignment"] = {
-            "left": _segments(ru, ref_status),
-            "right": _segments(hu, hyp_status),
-        }
+        result.update(
+            error_rate=rate,
+            accuracy=max(0.0, 1.0 - rate),
+            distance=distance,
+            truncated=True,
+            preview_limit=align_max,
+            alignment={
+                "left": _segments(ru, ref_status),
+                "right": _segments(hu, hyp_status),
+            },
+        )
 
     return result
 
@@ -308,7 +370,7 @@ def _char_diff_lines(a, b, ic, ip, isp, inl):
 
 def _word_diff_lines(a, b, ic, ip):
     """Word-level colouring of two lines against each other (for moved rows)."""
-    res = _eval_level(_word_units(a, ic, ip), _word_units(b, ic, ip), WORD_ALIGN_MAX)
+    res = _eval_level(_word_units(a, ic, ip), _word_units(b, ic, ip), WORD_ALIGN_MAX, reorder=True)
     al = res["alignment"]
     if al:
         return al["left"], al["right"]
@@ -508,6 +570,7 @@ def evaluate(
         _word_units(ground_truth, ignore_case, ignore_punct),
         _word_units(ocr_text, ignore_case, ignore_punct),
         WORD_ALIGN_MAX,
+        reorder=True,  # don't penalise reordered words; mark them "moved"
     )
     char = _eval_level(
         _char_units(ground_truth, ignore_case, ignore_punct, ignore_space, ignore_newline),

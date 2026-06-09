@@ -10,7 +10,12 @@ const fmt = (n) => n.toLocaleString();
 const DEMO_GT = new Map(DEMO_RECORDS.map((r) => [r.naId, r.gt]));
 const DEMO_OCR = new Map(DEMO_RECORDS.map((r) => [r.naId, r.ocr]));
 
-const SEG_CLASS = { error: "seg-error", neutral: "seg-neutral", match: "seg-match" };
+const SEG_CLASS = {
+  error: "seg-error",
+  neutral: "seg-neutral",
+  match: "seg-match",
+  moved: "seg-moved",
+};
 
 function HighlightView({ segments }) {
   return (
@@ -334,8 +339,11 @@ export default function App() {
               <>
                 <strong>{mode === "word" ? "Word" : "Character"} breakdown:</strong>{" "}
                 {fmt(lvl.counts.hits)} correct · {fmt(lvl.counts.substitutions)} substitutions ·{" "}
-                {fmt(lvl.counts.deletions)} deletions · {fmt(lvl.counts.insertions)} insertions ·
-                reference length {fmt(lvl.ref_length)}
+                {fmt(lvl.counts.deletions)} deletions · {fmt(lvl.counts.insertions)} insertions
+                {lvl.counts.moved > 0 && (
+                  <> · <span className="moved-tag">{fmt(lvl.counts.moved)} moved</span></>
+                )}{" "}
+                · reference length {fmt(lvl.ref_length)}
               </>
             ) : (
               <>
