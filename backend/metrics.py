@@ -150,36 +150,60 @@ def _statuses_reorder(n_ref, n_hyp, ops, ref_keys, hyp_keys):
     """
     ref = ["match"] * n_ref
     hyp = ["match"] * n_hyp
-    del_pos = []
-    ins_by_key = defaultdict(list)
-    sub = 0
+    del_pos, ins_pos, sub_pairs = [], [], []
     for op in ops:
         if op.tag == "replace":
             ref[op.src_pos] = "error"
             hyp[op.dest_pos] = "error"
-            sub += 1
+            sub_pairs.append((op.src_pos, op.dest_pos))
         elif op.tag == "delete":
             ref[op.src_pos] = "error"
             del_pos.append(op.src_pos)
         elif op.tag == "insert":
             hyp[op.dest_pos] = "error"
-            ins_by_key[hyp_keys[op.dest_pos]].append(op.dest_pos)
+            ins_pos.append(op.dest_pos)
 
-    moved = 0
-    for sp in del_pos:
-        lst = ins_by_key.get(ref_keys[sp])
+    # Reorder = an unmatched reference token whose key reappears among the
+    # unmatched hypothesis tokens (and vice versa), regardless of position. We
+    # consider BOTH sides of substitutions as candidates, so a swap/reversal that
+    # the aligner expressed as substitutions is still recognised as moved — while
+    # a genuine substitution (no matching token elsewhere) stays exactly 1 error.
+    gt_un = del_pos + [s for s, _ in sub_pairs]
+    oc_un = ins_pos + [d for _, d in sub_pairs]
+    oc_by_key = defaultdict(list)
+    for p in oc_un:
+        oc_by_key[hyp_keys[p]].append(p)
+    moved_ref, moved_hyp = set(), set()
+    for gp in gt_un:
+        lst = oc_by_key.get(ref_keys[gp])
         if lst:
-            ref[sp] = "moved"
-            hyp[lst.pop()] = "moved"
-            moved += 1
+            op_ = lst.pop()
+            moved_ref.add(gp)
+            moved_hyp.add(op_)
+    for gp in moved_ref:
+        ref[gp] = "moved"
+    for op_ in moved_hyp:
+        hyp[op_] = "moved"
 
-    del_remaining = len(del_pos) - moved
-    ins_remaining = sum(len(v) for v in ins_by_key.values())
+    del_rem = sum(1 for p in del_pos if p not in moved_ref)
+    ins_rem = sum(1 for p in ins_pos if p not in moved_hyp)
+    sub_rem = 0
+    for s, dd in sub_pairs:
+        gm, om = s in moved_ref, dd in moved_hyp
+        if gm and om:
+            pass                # both reordered -> no error
+        elif gm:
+            ins_rem += 1        # ref word moved away, hyp word orphaned -> insertion
+        elif om:
+            del_rem += 1        # hyp word moved away, ref word orphaned -> deletion
+        else:
+            sub_rem += 1        # genuine substitution -> 1 error
+    moved = len(moved_ref)
     counts = {
-        "substitutions": sub,
-        "deletions": del_remaining,
-        "insertions": ins_remaining,
-        "hits": n_ref - sub - len(del_pos),
+        "substitutions": sub_rem,
+        "deletions": del_rem,
+        "insertions": ins_rem,
+        "hits": n_ref - len(sub_pairs) - len(del_pos),
         "moved": moved,
     }
     return ref, hyp, counts
