@@ -382,6 +382,60 @@ def _word_diff_lines(a, b, ic, ip):
     return left, right
 
 
+def _local_char_status(a, b, ic, ip, isp, inl):
+    """Per-character status (match/error/neutral) for two strings against each other."""
+    au = _char_units(a, ic, ip, isp, inl)
+    bu = _char_units(b, ic, ip, isp, inl)
+    if a == b:
+        return ([("neutral" if k is None else "match") for _, k in au],
+                [("neutral" if k is None else "match") for _, k in bu])
+    ak = [k for _, k in au if k is not None]
+    bk = [k for _, k in bu if k is not None]
+    ast, bst = _statuses(len(ak), len(bk), Levenshtein.editops(*_encode(ak, bk)))
+
+    def expand(units, comp):
+        out, ci = [], 0
+        for _, k in units:
+            if k is None:
+                out.append("neutral")
+            else:
+                out.append(comp[ci])
+                ci += 1
+        return out
+
+    return expand(au, ast), expand(bu, bst)
+
+
+def _anchored_char_status(gt, oc, gspan, ospan, items, ic, ip, isp, inl):
+    """
+    Per-character colouring for the whole document, anchored on the WORD
+    alignment. Each matched word pins the local correspondence; the chars in the
+    region *between* two matched words are diffed locally. This avoids the
+    in-order global aligner stealing matches across repeated text (e.g. "1832."
+    appearing many times) while still matching content that the OCR split across
+    a word boundary (e.g. "doc-\\n umentary").
+    """
+    g_cstat = ["match"] * len(gt)
+    o_cstat = ["match"] * len(oc)
+    g_pos = o_pos = 0
+
+    def assign(g0, g1, o0, o1):
+        ast, bst = _local_char_status(gt[g0:g1], oc[o0:o1], ic, ip, isp, inl)
+        g_cstat[g0:g1] = ast
+        o_cstat[o0:o1] = bst
+
+    for typ, gi, oi in items:
+        if typ != "equal":
+            continue  # diff words are folded into the region before the next anchor
+        gws, gwe = gspan[gi]
+        ows, owe = ospan[oi]
+        assign(g_pos, gws, o_pos, ows)   # region between the previous anchor and this match
+        assign(gws, gwe, ows, owe)       # the matched word itself
+        g_pos, o_pos = gwe, owe
+    assign(g_pos, len(gt), o_pos, len(oc))  # trailing region
+    return g_cstat, o_cstat
+
+
 def align_lines(
     ground_truth: str,
     ocr_text: str,
@@ -496,24 +550,9 @@ def align_lines(
     # use a local char diff so their content stays green.
     g_cstat = o_cstat = None
     if level == "char" and max(len(ground_truth), len(ocr_text)) <= _CHAR_GLOBAL_MAX:
-        gcu = _char_units(ground_truth, ic, ip, isp, inl)
-        ocu = _char_units(ocr_text, ic, ip, isp, inl)
-        gck = [k for _, k in gcu if k is not None]
-        ock = [k for _, k in ocu if k is not None]
-        gcs, ocs = _statuses(len(gck), len(ock), Levenshtein.editops(*_encode(gck, ock)))
-
-        def _expand(units, comp):
-            out, ci = [], 0
-            for _, k in units:
-                if k is None:
-                    out.append("neutral")
-                else:
-                    out.append(comp[ci])
-                    ci += 1
-            return out
-
-        g_cstat = _expand(gcu, gcs)
-        o_cstat = _expand(ocu, ocs)
+        g_cstat, o_cstat = _anchored_char_status(
+            ground_truth, ocr_text, gspan, ospan, items, ic, ip, isp, inl
+        )
 
     def _char_status_segs(text, status, start, end):
         segs = []
