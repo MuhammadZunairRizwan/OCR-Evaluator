@@ -10,8 +10,6 @@ frontend/dist/
 frontend/node_modules/
 
 # Env files (keep .env.example)
-.env
-.env.*
 !.env.example
 frontend/.env
 frontend/.env.*
@@ -54,7 +52,6 @@ htmlcov/
 test-data/*.csv
 
 # ---------- Editor / OS ----------
-.vscode/
 .idea/
 *.swp
 *.swo
@@ -65,3 +62,9 @@ Desktop.ini
 branch_structure.json
 temp_auto_push.bat
 temp_interactive_push.bat
+
+# Playwright
+test-results/
+playwright-report/
+playwright/.cache/
+config.bat
